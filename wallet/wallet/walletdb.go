@@ -156,7 +156,6 @@ func (la *LinkAccount) loadTransfers() error {
 			if !tx.Spent && !tx.Frozen {
 				la.updateBalance(tx.TokenID, tx.SubAddrIndex, true, tx.Amount)
 			}
-
 			la.keyImages[tx.KeyImage] = i
 		}
 	}

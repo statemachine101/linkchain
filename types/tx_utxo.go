@@ -49,7 +49,7 @@ var (
 	ErrDerivationScalar           = errors.New("derivaion scalar fail")
 	ErrGenerateKeyImage           = errors.New("generate key image fail")
 	ErrOutputNotBelongToAccount   = errors.New("output not belong to account")
-	ErrInMoneyLessThanOutMoney    = errors.New("input money less than output money")
+	ErrMoneyNotEqual              = errors.New("input money is not equal to output money")
 	ErrOutSkSizeNotMatch          = errors.New("outSk size does not match outputs")
 	ErrUtxoOutSizeNotExpect       = errors.New("utxo output size not expect")
 	ErrMoneyInvalid               = errors.New("money invalid")
@@ -80,13 +80,20 @@ var (
 )
 
 const (
-	BULLETPROOF_MAX_OUTPUTS     int   = 16
-	CRYPTONOTE_MAX_TX_SIZE      int   = 1000000
-	SHORT_RING_MEMBER_NUM       int   = 1
-	UTXO_COMMITMENT_CHANGE_RATE int64 = 1e10
+	BULLETPROOF_MAX_OUTPUTS int = 16
+	CRYPTONOTE_MAX_TX_SIZE  int = 1000000
+	SHORT_RING_MEMBER_NUM   int = 1
+	//UTXO_COMMITMENT_CHANGE_RATE int64 = 1e10
 )
 
 var _ RegularTx = &UTXOTransaction{}
+
+func GetUtxoCommitmentChangeRate(addr common.Address) int64 {
+	if common.IsLKC(addr) {
+		return 1e10
+	}
+	return 1
+}
 
 func RegisterUTXOTxData() {
 	ser.RegisterConcrete(&UTXOTransaction{}, TxUTXO, nil)
@@ -732,10 +739,11 @@ func (tx UTXOTransaction) GetOutputData(blockHeight uint64) []*UTXOOutputData {
 		case *UTXOOutput:
 			commitment := tx.RCTSig.OutPk[idx].Mask
 			outputdata := &UTXOOutputData{
-				OTAddr: output.OTAddr,
-				Height: blockHeight,
-				Commit: commitment,
-				Remark: output.Remark,
+				OTAddr:  output.OTAddr,
+				Height:  blockHeight,
+				Commit:  commitment,
+				Remark:  output.Remark,
+				TokenID: tx.TokenID,
 			}
 			utxoOutputs = append(utxoOutputs, outputdata)
 		case *AccountInput:
@@ -803,9 +811,6 @@ func (tx *UTXOTransaction) checkTxSemantic(censor TxCensor) error {
 	if len(tx.Inputs) <= 0 {
 		return ErrCheckNoInput
 	}
-	if !common.IsLKC(tx.TokenID) {
-		return fmt.Errorf("thirdparty token not support yet!")
-	}
 
 	utxoInNum := 0
 	utxoOutNum := 0
@@ -847,8 +852,8 @@ func (tx *UTXOTransaction) checkTxSemantic(censor TxCensor) error {
 			if (kind & Ain) == Ain {
 				return ErrAccountInputSizeNotExpect
 			}
-			if input.Amount == nil || input.Amount.Cmp(big.NewInt(UTXO_COMMITMENT_CHANGE_RATE)) < 0 ||
-				big.NewInt(0).Mod(input.Amount, big.NewInt(UTXO_COMMITMENT_CHANGE_RATE)).Sign() != 0 {
+			if input.Amount == nil || input.Amount.Cmp(big.NewInt(GetUtxoCommitmentChangeRate(tx.TokenID))) < 0 ||
+				big.NewInt(0).Mod(input.Amount, big.NewInt(GetUtxoCommitmentChangeRate(tx.TokenID))).Sign() != 0 {
 				return ErrMoneyInvalid
 			}
 
@@ -877,8 +882,8 @@ func (tx *UTXOTransaction) checkTxSemantic(censor TxCensor) error {
 			if output.Amount == nil || output.Amount.Sign() < 0 {
 				return ErrMoneyInvalid
 			}
-			if output.Amount.Sign() > 0 && (output.Amount.Cmp(big.NewInt(UTXO_COMMITMENT_CHANGE_RATE)) < 0 ||
-				big.NewInt(0).Mod(output.Amount, big.NewInt(UTXO_COMMITMENT_CHANGE_RATE)).Sign() != 0) {
+			if output.Amount.Sign() > 0 && (output.Amount.Cmp(big.NewInt(GetUtxoCommitmentChangeRate(tx.TokenID))) < 0 ||
+				big.NewInt(0).Mod(output.Amount, big.NewInt(GetUtxoCommitmentChangeRate(tx.TokenID))).Sign() != 0) {
 				return ErrMoneyInvalid
 			}
 			if hasOneAccountOutput {
@@ -922,13 +927,13 @@ func (tx *UTXOTransaction) checkTxSemantic(censor TxCensor) error {
 
 	feeModGas := big.NewInt(0).Mod(tx.Fee, big.NewInt(0).SetInt64(ParGasPrice))
 	if feeModGas.Sign() != 0 {
-		log.Warn("Fee not illegal, must be mutiple of GasPrice", "txhash", tx.Hash(), "Fee", tx.Fee)
+		log.Warn("Fee illegal, must be mutiple of GasPrice", "txhash", tx.Hash(), "Fee", tx.Fee)
 		return ErrUtxoTxFeeIllegal
 	}
 
 	log.Debug("UTXOKind", "txhash", tx.Hash(), "kind", kind, "normalAddrCount", normalAddrCount, "contractAddrCount", contractAddrCount)
-	if (kind&Ain) == Ain || contractAddrCount > 0 {
-		//AccountInput or call contract need account signature
+	if (kind&Ain) == Ain || contractAddrCount > 0 || !common.IsLKC(tx.TokenID) {
+		//Signature is needed if hasAin / call contract / token tranfer(to pay txfee)
 		fromAddr, err := tx.From()
 		if err != nil {
 			return ErrInvalidSig
@@ -989,7 +994,7 @@ func (tx *UTXOTransaction) checkCommitEqual() error {
 			switch input := txin.(type) {
 			case *UTXOInput:
 			case *AccountInput:
-				commit := AmountCommit(big.NewInt(0).Div(input.Amount, big.NewInt(UTXO_COMMITMENT_CHANGE_RATE)), input.CF)
+				commit := AmountCommit(big.NewInt(0).Div(input.Amount, big.NewInt(GetUtxoCommitmentChangeRate(tx.TokenID))), input.CF)
 				if !commit.IsEqual(&input.Commit) {
 					return ErrCheckAmountCommit
 				}
@@ -1032,7 +1037,8 @@ func (tx *UTXOTransaction) checkCommitEqual() error {
 	}
 
 	if common.IsLKC(tx.TokenID) {
-		txFeekey, err := BigInt2Hash(big.NewInt(0).Div(tx.Fee, big.NewInt(UTXO_COMMITMENT_CHANGE_RATE)))
+		//Fee commit always use lkc addr
+		txFeekey, err := BigInt2Hash(big.NewInt(0).Div(tx.Fee, big.NewInt(GetUtxoCommitmentChangeRate(common.EmptyAddress))))
 		if err != nil {
 			log.Warn("UTXO BigInt2Hash Error")
 			return err
@@ -1055,7 +1061,7 @@ func (tx *UTXOTransaction) checkCommitEqual() error {
 			switch output := txin.(type) {
 			case *UTXOOutput:
 			case *AccountOutput:
-				oAmountKey, err := BigInt2Hash(big.NewInt(0).Div(output.Amount, big.NewInt(UTXO_COMMITMENT_CHANGE_RATE)))
+				oAmountKey, err := BigInt2Hash(big.NewInt(0).Div(output.Amount, big.NewInt(GetUtxoCommitmentChangeRate(tx.TokenID))))
 				if err != nil {
 					log.Warn("Amount bigInt2hash Error")
 					return err
@@ -1179,7 +1185,7 @@ func (tx *UTXOTransaction) checkRingctSignatures(pubkeys [][]types.Ctkey) error 
 	//short ring member
 	if len(tx.RCTSig.MixRing) > 0 && len(tx.RCTSig.MixRing[0]) == SHORT_RING_MEMBER_NUM {
 		for i := 1; i < len(tx.RCTSig.MixRing); i++ {
-			if len(tx.RCTSig.MixRing[0]) > 0 && len(tx.RCTSig.MixRing[0]) != SHORT_RING_MEMBER_NUM {
+			if len(tx.RCTSig.MixRing[i]) > 0 && len(tx.RCTSig.MixRing[i]) != SHORT_RING_MEMBER_NUM {
 				return ErrMixRingMemberNotSupport
 			}
 		}
@@ -1228,7 +1234,7 @@ func (tx *UTXOTransaction) checkRingctSignatures(pubkeys [][]types.Ctkey) error 
 	return nil
 }
 
-//CheckStoreState check an UTXOTransaction stroe state
+//CheckStoreState check an UTXOTransaction store state
 func (tx *UTXOTransaction) CheckStoreState(censor TxCensor, state State) error {
 	aggInputAmount := big.NewInt(0)
 
@@ -1275,19 +1281,27 @@ func (tx *UTXOTransaction) CheckStoreState(censor TxCensor, state State) error {
 	}
 
 	neededGas := big.NewInt(0)
-	if aggInputAmount.Sign() > 0 && aggInputAmount.Cmp(tx.Fee) > 0 {
-		neededGas.SetUint64(CalNewAmountGas(aggInputAmount.Sub(aggInputAmount, tx.Fee), EverLiankeFee))
+	kind := tx.UTXOKind()
+
+	if common.IsLKC(tx.TokenID) {
+		if (kind & Ain) == Ain {
+			if aggInputAmount.Sign() > 0 && aggInputAmount.Cmp(tx.Fee) > 0 {
+				neededGas.SetUint64(CalNewAmountGas(aggInputAmount.Sub(aggInputAmount, tx.Fee), EverLiankeFee))
+			}
+		} else { // Uin-Aout, due to non-coexistance of Ain & Uin
+			if accOutAmount.Sign() > 0 {
+				neededGas.Add(neededGas, big.NewInt(0).SetUint64(CalNewAmountGas(accOutAmount, EverLiankeFee)))
+			}
+		}
+	} else {
+		if (kind & AinAout) != IllKind { // Not Pure Uin-Uout Tx
+			neededGas.SetUint64(CalNewAmountGas(big.NewInt(0), EverLiankeFee))
+		}
 	}
 
-	kind := tx.UTXOKind()
-	if (kind & Uin) == Uin {
-		if accOutAmount.Sign() > 0 {
-			neededGas.Add(neededGas, big.NewInt(0).SetUint64(CalNewAmountGas(accOutAmount, EverLiankeFee)))
-		}
-		if (kind & Uout) == Uout {
-			utxoGas := censor.GetUTXOGas()
-			neededGas.Add(neededGas, big.NewInt(0).SetUint64(utxoGas))
-		}
+	if (kind & UinUout) == UinUout { // Confidential Tx Fee
+		utxoGas := censor.GetUTXOGas()
+		neededGas.Add(neededGas, big.NewInt(0).SetUint64(utxoGas))
 	}
 
 	neededFee := neededGas.Mul(neededGas, big.NewInt(0).SetInt64(ParGasPrice))
@@ -1359,19 +1373,27 @@ func (tx *UTXOTransaction) checkState(censor TxCensor) error {
 	}
 
 	neededGas := big.NewInt(0)
-	if aggInputAmount.Sign() > 0 && aggInputAmount.Cmp(tx.Fee) > 0 {
-		neededGas.SetUint64(CalNewAmountGas(aggInputAmount.Sub(aggInputAmount, tx.Fee), EverLiankeFee))
+	kind := tx.UTXOKind()
+
+	if common.IsLKC(tx.TokenID) {
+		if (kind & Ain) == Ain {
+			if aggInputAmount.Sign() > 0 && aggInputAmount.Cmp(tx.Fee) > 0 {
+				neededGas.SetUint64(CalNewAmountGas(aggInputAmount.Sub(aggInputAmount, tx.Fee), EverLiankeFee))
+			}
+		} else { // Uin-Aout, due to non-coexistance of Ain & Uin
+			if accOutAmount.Sign() > 0 {
+				neededGas.Add(neededGas, big.NewInt(0).SetUint64(CalNewAmountGas(accOutAmount, EverLiankeFee)))
+			}
+		}
+	} else {
+		if (kind & AinAout) != IllKind { // Not Pure Uin-Uout Tx
+			neededGas.SetUint64(CalNewAmountGas(big.NewInt(0), EverLiankeFee))
+		}
 	}
 
-	kind := tx.UTXOKind()
-	if (kind & Uin) == Uin {
-		if accOutAmount.Sign() > 0 {
-			neededGas.Add(neededGas, big.NewInt(0).SetUint64(CalNewAmountGas(accOutAmount, EverLiankeFee)))
-		}
-		if (kind & Uout) == Uout {
-			utxoGas := censor.GetUTXOGas()
-			neededGas.Add(neededGas, big.NewInt(0).SetUint64(utxoGas))
-		}
+	if (kind & UinUout) == UinUout { // Confidential Tx Fee
+		utxoGas := censor.GetUTXOGas()
+		neededGas.Add(neededGas, big.NewInt(0).SetUint64(utxoGas))
 	}
 
 	neededFee := neededGas.Mul(neededGas, big.NewInt(0).SetInt64(ParGasPrice))
@@ -1417,7 +1439,7 @@ func d2h(amount uint64) types.Key {
 //3 construct UTXOTransaction, erase output money
 //4 compute RangeBulletproof, utxo commitment, account commitment
 //5 compute account sig
-func NewAinTransaction(accSource *AccountSourceEntry, dests []DestEntry, tokenID common.Address, extra []byte) (*UTXOTransaction, *types.Key, error) {
+func NewAinTransaction(accSource *AccountSourceEntry, dests []DestEntry, tokenID common.Address, fee *big.Int, extra []byte) (*UTXOTransaction, *types.Key, error) {
 	rSecKey, rPubKey := xcrypto.SkpkGen()
 	var utxoDests []*UTXODestEntry
 	for _, dest := range dests {
@@ -1433,7 +1455,7 @@ func NewAinTransaction(accSource *AccountSourceEntry, dests []DestEntry, tokenID
 	if err != nil {
 		return nil, nil, err
 	}
-	utxoTrans, err := constructAinTrans(rPubKey, accSource, dests, utxoOuts, additionalKeys, tokenID, extra)
+	utxoTrans, err := constructAinTrans(rPubKey, accSource, dests, utxoOuts, additionalKeys, tokenID, fee, extra)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1445,7 +1467,7 @@ func NewAinTransaction(accSource *AccountSourceEntry, dests []DestEntry, tokenID
 }
 
 func constructAinTrans(rPubKey types.Key, source *AccountSourceEntry, dests []DestEntry, utxoOuts []*UTXOOutput,
-	additionalKeys []types.PublicKey, tokenID common.Address, extra []byte) (*UTXOTransaction, error) {
+	additionalKeys []types.PublicKey, tokenID common.Address, fee *big.Int, extra []byte) (*UTXOTransaction, error) {
 	utxoTrans := &UTXOTransaction{
 		Outputs: make([]Output, len(dests)),
 		RKey:    types.PublicKey(rPubKey),
@@ -1487,10 +1509,18 @@ func constructAinTrans(rPubKey types.Key, source *AccountSourceEntry, dests []De
 		}
 		outAmount.Add(outAmount, dest.GetAmount())
 	}
-	if inAmount.Cmp(outAmount) < 0 {
-		return nil, ErrInMoneyLessThanOutMoney
+
+	utxoTrans.Fee = fee
+	if common.IsLKC(tokenID) {
+		if inAmount.Cmp(big.NewInt(0).Add(outAmount, fee)) != 0 {
+			return nil, ErrMoneyNotEqual
+		}
+	} else {
+		if inAmount.Cmp(outAmount) != 0 {
+			return nil, ErrMoneyNotEqual
+		}
 	}
-	utxoTrans.Fee = big.NewInt(0).Sub(inAmount, outAmount)
+
 	return utxoTrans, nil
 }
 
@@ -1498,7 +1528,7 @@ func aInTransWithRctSig(utxoTrans *UTXOTransaction, dests []DestEntry, mkeys typ
 	outAmounts := make([]types.Key, 0)
 	for _, dest := range dests {
 		if TypeUTXODest == dest.Type() {
-			amountKey, err := BigInt2Hash(big.NewInt(0).Div(dest.GetAmount(), big.NewInt(UTXO_COMMITMENT_CHANGE_RATE)))
+			amountKey, err := BigInt2Hash(big.NewInt(0).Div(dest.GetAmount(), big.NewInt(GetUtxoCommitmentChangeRate(utxoTrans.TokenID))))
 			if err != nil {
 				return err
 			}
@@ -1545,7 +1575,7 @@ func aInTransWithRctSig(utxoTrans *UTXOTransaction, dests []DestEntry, mkeys typ
 	}
 	for i, output := range utxoTrans.Outputs {
 		if OutAc == output.Type() {
-			amountKey, err := BigInt2Hash(big.NewInt(0).Div(output.(*AccountOutput).Amount, big.NewInt(UTXO_COMMITMENT_CHANGE_RATE)))
+			amountKey, err := BigInt2Hash(big.NewInt(0).Div(output.(*AccountOutput).Amount, big.NewInt(GetUtxoCommitmentChangeRate(utxoTrans.TokenID))))
 			if err != nil {
 				return err
 			}
@@ -1558,7 +1588,7 @@ func aInTransWithRctSig(utxoTrans *UTXOTransaction, dests []DestEntry, mkeys typ
 	if InAc != utxoTrans.Inputs[0].Type() {
 		return ErrInputTypeNotExpect
 	}
-	amountKey, err := BigInt2Hash(big.NewInt(0).Div(utxoTrans.Inputs[0].(*AccountInput).Amount, big.NewInt(UTXO_COMMITMENT_CHANGE_RATE)))
+	amountKey, err := BigInt2Hash(big.NewInt(0).Div(utxoTrans.Inputs[0].(*AccountInput).Amount, big.NewInt(GetUtxoCommitmentChangeRate(utxoTrans.TokenID))))
 	if err != nil {
 		return err
 	}
@@ -1616,7 +1646,7 @@ func Hash2BigInt(key types.Key) *big.Int {
 //4 construct UTXOTransaction, erase input and output money
 //5 compute RangeBulletproof, utxo commitment, account commitment, ring signature
 func NewUinTransaction(acc *types.AccountKey, keyIndex map[types.PublicKey]uint64, utxoSources []*UTXOSourceEntry,
-	dests []DestEntry, tokenID common.Address, refundAddr common.Address, extra []byte) (*UTXOTransaction, []*UTXOInputEphemeral, types.KeyV, *types.Key, error) {
+	dests []DestEntry, tokenID common.Address, refundAddr common.Address, fee *big.Int, extra []byte) (*UTXOTransaction, []*UTXOInputEphemeral, types.KeyV, *types.Key, error) {
 	rSecKey, rPubKey := xcrypto.SkpkGen()
 	utxoInEphs, err := GenerateKeyImage(acc, keyIndex, utxoSources)
 	if err != nil {
@@ -1636,7 +1666,7 @@ func NewUinTransaction(acc *types.AccountKey, keyIndex map[types.PublicKey]uint6
 	if err != nil {
 		return nil, nil, types.KeyV{}, nil, err
 	}
-	utxoTrans, err := constructUinTrans(rPubKey, utxoSources, utxoInEphs, dests, utxoOuts, additionalKeys, mKeys, tokenID, refundAddr, extra)
+	utxoTrans, err := constructUinTrans(rPubKey, utxoSources, utxoInEphs, dests, utxoOuts, additionalKeys, mKeys, tokenID, refundAddr, fee, extra)
 	if err != nil {
 		return nil, nil, types.KeyV{}, nil, err
 	}
@@ -1644,7 +1674,7 @@ func NewUinTransaction(acc *types.AccountKey, keyIndex map[types.PublicKey]uint6
 }
 
 func constructUinTrans(rPubKey types.Key, sources []*UTXOSourceEntry, utxoIns []*UTXOInputEphemeral, dests []DestEntry, utxoOuts []*UTXOOutput,
-	additionalKeys []types.PublicKey, mkeys types.KeyV, tokenID common.Address, refundAddr common.Address, extra []byte) (*UTXOTransaction, error) {
+	additionalKeys []types.PublicKey, mkeys types.KeyV, tokenID common.Address, refundAddr common.Address, fee *big.Int, extra []byte) (*UTXOTransaction, error) {
 	utxoTrans := &UTXOTransaction{
 		Inputs:  make([]Input, len(sources)),
 		Outputs: make([]Output, len(dests)),
@@ -1708,17 +1738,25 @@ func constructUinTrans(rPubKey types.Key, sources []*UTXOSourceEntry, utxoIns []
 			n++
 		} else {
 			accOutput := output.(*AccountOutput)
-			amountKey, err := BigInt2Hash(big.NewInt(0).Div(accOutput.Amount, big.NewInt(UTXO_COMMITMENT_CHANGE_RATE)))
+			amountKey, err := BigInt2Hash(big.NewInt(0).Div(accOutput.Amount, big.NewInt(GetUtxoCommitmentChangeRate(utxoTrans.TokenID))))
 			if err != nil {
 				return nil, err
 			}
 			accOutput.Commit = ringct.ScalarmultH(amountKey)
 		}
 	}
-	if inAmount.Cmp(outAmount) < 0 {
-		return nil, ErrInMoneyLessThanOutMoney
+
+	utxoTrans.Fee = fee
+	if common.IsLKC(tokenID) {
+		if inAmount.Cmp(big.NewInt(0).Add(outAmount, fee)) != 0 {
+			return nil, ErrMoneyNotEqual
+		}
+	} else {
+		if inAmount.Cmp(outAmount) != 0 {
+			return nil, ErrMoneyNotEqual
+		}
 	}
-	utxoTrans.Fee = big.NewInt(0).Sub(inAmount, outAmount)
+
 	return utxoTrans, nil
 }
 
@@ -1727,7 +1765,7 @@ func UInTransWithRctSig(utxoTrans *UTXOTransaction, sources []*UTXOSourceEntry, 
 	outAmounts := make([]types.Key, 0)
 	for _, dest := range dests {
 		if TypeUTXODest == dest.Type() {
-			amountKey, err := BigInt2Hash(big.NewInt(0).Div(dest.GetAmount(), big.NewInt(UTXO_COMMITMENT_CHANGE_RATE)))
+			amountKey, err := BigInt2Hash(big.NewInt(0).Div(dest.GetAmount(), big.NewInt(GetUtxoCommitmentChangeRate(utxoTrans.TokenID))))
 			if err != nil {
 				return err
 			}
@@ -1778,7 +1816,7 @@ func UInTransWithRctSig(utxoTrans *UTXOTransaction, sources []*UTXOSourceEntry, 
 				Mask: sources[i].Ring[j].Commit,
 			}
 		}
-		amountKey, err := BigInt2Hash(big.NewInt(0).Div(sources[i].Amount, big.NewInt(UTXO_COMMITMENT_CHANGE_RATE)))
+		amountKey, err := BigInt2Hash(big.NewInt(0).Div(sources[i].Amount, big.NewInt(GetUtxoCommitmentChangeRate(utxoTrans.TokenID))))
 		if err != nil {
 			return err
 		}
