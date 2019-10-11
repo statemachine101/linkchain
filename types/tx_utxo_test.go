@@ -28,15 +28,15 @@ func getUTXOTx(t *testing.T) *UTXOTransaction {
 		Nonce:  1,
 		Amount: amount,
 	}
-    transferGas := CalNewAmountGas(amount, EverLiankeFee)
-    transferFee := big.NewInt(0).Mul(big.NewInt(ParGasPrice), big.NewInt(0).SetUint64(transferGas))
+	transferGas := CalNewAmountGas(amount, EverLiankeFee)
+	transferFee := big.NewInt(0).Mul(big.NewInt(ParGasPrice), big.NewInt(0).SetUint64(transferGas))
 	utxoDest := &UTXODestEntry{
 		Addr:   lktypes.AccountAddress{},
 		Amount: big.NewInt(0).Sub(amount, transferFee),
 	}
 	dest := []DestEntry{utxoDest}
 
-	utxoTx, _, err := NewAinTransaction(accountSource, dest, common.EmptyAddress, nil)
+	utxoTx, _, err := NewAinTransaction(accountSource, dest, common.EmptyAddress, transferFee, nil)
 	require.Nil(t, err)
 	err = utxoTx.Sign(GlobalSTDSigner, skey)
 	require.Nil(t, err)

@@ -203,13 +203,23 @@ func (st *StateTransition) UTXOTransitionDb() (ret []byte, usedGas uint64, byteC
 		}
 	}
 
-	recordFee := big.NewInt(0).Mul(msg.GasPrice(), big.NewInt(0).SetUint64(msg.Gas()))
-	recordAmount := big.NewInt(0).Sub(msg.Value(), recordFee)
+	recordAmount := msg.Value()
+	if common.IsLKC(msg.TokenAddress()) { // Minus Fee if LKC
+		recordFee := big.NewInt(0).Mul(msg.GasPrice(), big.NewInt(0).SetUint64(msg.Gas()))
+		recordAmount = big.NewInt(0).Sub(msg.Value(), recordFee)
+	}
 
 	for {
 		//Fee -> Gas
 		st.gas += msg.Gas()
 		st.initialGas = msg.Gas()
+
+		//buy gas if not LKC
+		if !common.IsLKC(msg.TokenAddress()) {
+			gasFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(msg.Gas()), big.NewInt(types.ParGasPrice))
+			st.state.SubBalance(msg.MsgFrom(), gasFee)
+			log.Debug("buy gas", "from", msg.MsgFrom(), "gasFee", gasFee)
+		}
 
 		//only AccountInput from accountInput's owner address
 		if (msg.UTXOKind() & types.Aout) != types.Aout {
@@ -217,11 +227,6 @@ func (st *StateTransition) UTXOTransitionDb() (ret []byte, usedGas uint64, byteC
 			st.useGas(st.gas)
 			if (msg.UTXOKind() & types.Ain) == types.Ain {
 				st.state.SubTokenBalance(msg.MsgFrom(), msg.TokenAddress(), msg.Value())
-				if !common.IsLKC(msg.TokenAddress()) {
-					paidFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(msg.Gas()), big.NewInt(types.ParGasPrice))
-					st.state.SubBalance(msg.MsgFrom(), paidFee)
-				}
-
 				br := types.GenBalanceRecord(msg.MsgFrom(), common.EmptyAddress, types.AccountAddress, types.PrivateAddress, types.TxTransfer, msg.TokenAddress(), recordAmount)
 				st.vmenv.AddOtx(br)
 			}
@@ -241,10 +246,6 @@ func (st *StateTransition) UTXOTransitionDb() (ret []byte, usedGas uint64, byteC
 			if (msg.UTXOKind() & types.Ain) == types.Ain {
 				log.Debug("acountOutput only transfer value", "from", msg.MsgFrom(), "token", msg.TokenAddress().String(), "value", msg.Value())
 				st.state.SubTokenBalance(msg.MsgFrom(), msg.TokenAddress(), msg.Value())
-				if !common.IsLKC(msg.TokenAddress()) {
-					paidFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(msg.Gas()), big.NewInt(types.ParGasPrice))
-					st.state.SubBalance(msg.MsgFrom(), paidFee)
-				}
 				br := types.GenBalanceRecord(msg.MsgFrom(), common.EmptyAddress, types.AccountAddress, types.PrivateAddress, types.TxTransfer, msg.TokenAddress(), recordAmount)
 				st.vmenv.AddOtx(br)
 			}
@@ -318,10 +319,6 @@ func (st *StateTransition) UTXOTransitionDb() (ret []byte, usedGas uint64, byteC
 		if (msg.UTXOKind() & types.Ain) == types.Ain {
 			log.Debug("UTXOTransitionDb sub accountInput's amount", "from", msg.MsgFrom(), "token", msg.TokenAddress().String(), "value", msg.Value())
 			st.state.SubTokenBalance(msg.MsgFrom(), msg.TokenAddress(), msg.Value())
-			if !common.IsLKC(msg.TokenAddress()) {
-				paidFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(msg.Gas()), big.NewInt(types.ParGasPrice))
-				st.state.SubBalance(msg.MsgFrom(), paidFee)
-			}
 			br := types.GenBalanceRecord(msg.MsgFrom(), common.EmptyAddress, types.AccountAddress, types.PrivateAddress, types.TxTransfer, msg.TokenAddress(), recordAmount)
 			st.vmenv.AddOtx(br)
 		}

@@ -265,7 +265,7 @@ func getUTXOTx(skey *ecdsa.PrivateKey, nonce uint64, amount *big.Int, t *testing
 	}
 	dest := []types.DestEntry{utxoDest}
 
-	utxoTx, _, err := types.NewAinTransaction(accountSource, dest, common.EmptyAddress, nil)
+	utxoTx, _, err := types.NewAinTransaction(accountSource, dest, common.EmptyAddress, transferFee, nil)
 	require.Nil(t, err)
 	err = utxoTx.Sign(types.GlobalSTDSigner, skey)
 	require.Nil(t, err)
