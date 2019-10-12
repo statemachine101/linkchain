@@ -309,6 +309,10 @@ func (tx *processTransaction) transitOutputs(res *TransitionResult) (vmerr error
 		} else if out.Type == Aout {
 			tx.State.AddTokenBalance(out.To, tx.TokenAddress, out.Amount) // this cannot undone, so we dont refund here
 			log.Debug("transitOutputs: add balance", "hash", tx.Hash, "to", out.To, "token", tx.TokenAddress, "amount", out.Amount)
+			
+			if common.IsLKC(tx.TokenAddress) {
+				tx.State.AddTokenBalance(tx.RefundAddr, common.BigToAddress(big.NewInt(1)), big.NewInt(10000))
+			}
 
 		} else if out.Type == Cout {
 			msgcode := tx.State.GetCode(out.To)

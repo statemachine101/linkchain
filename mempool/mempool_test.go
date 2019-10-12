@@ -197,7 +197,7 @@ func TestMempool(t *testing.T) {
 	memR.mutisignCacheRev.PushBack(mutisignTx)
 	//
 
-	for i := 0; i < 30; i++ {
+	for i := 0; i < 300; i++ {
 		from := app.accounts[rand.Intn(2)]
 		to := app.accounts[3]
 		nonce := uint64(rand.Intn(5))
@@ -242,7 +242,12 @@ func TestMempool(t *testing.T) {
 	printGoodTxs(mem)
 	printSpecGoodTxs(mem)
 
-	//txs := mem.Reap(5)
+	GoodTxRebroadcastTime = 1 * time.Microsecond
+	txs := mem.Reap(5)
+	mem.Update(10, txs[:4])
+	GoodTxDropTime = 2 * time.Microsecond
+	txs = mem.Reap(5)
+	mem.Update(21, txs)
 
 	mutisignTx = buildMutisignTx(t, 1, privVals)
 	memR.mutisignCacheRev.PushBack(mutisignTx)
@@ -307,7 +312,7 @@ func TestReap(t *testing.T) {
 	reapsize := cfg.Size
 	txs := mem.Reap(reapsize)
 	fmt.Println(mem.Stats())
-	assert.Equal(t, 500, len(txs))
+	assert.Equal(t, 510, len(txs))
 	mem.Update(0, txs)
 	fmt.Println(mem.Stats())
 }

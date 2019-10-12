@@ -12,7 +12,7 @@ fi
 
 if [ `docker ps -a | grep $NetName | wc -l` -lt 1 ]; then
     echo docker run container $NetName
-    docker run -v $DockerDir:/src/linkchain -w /src/linkchain -dit --name $NetName centos:7 bash
+    docker run -v $DockerDir:/src/linkchain -w /src/linkchain -dit -p 17001-17004:17001-17004 -p 47001:47001/tcp --cap-add=NET_ADMIN --name $NetName centos:7 bash 
     #echo run \"docker exec lklocaltest bash /src/linkchain/sbin/start4node.sh init\" to init the linkchain lklocaltest with 4 nodes
     #echo run \"docker exec lklocaltest bash /src/linkchain/sbin/start4node.sh start\" to start the linkchain lklocaltest with 4 nodes
     #echo run \"docker exec -it lklocaltest bash\" to create a new Bash session in the container lklocaltest

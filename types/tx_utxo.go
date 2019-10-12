@@ -1347,6 +1347,7 @@ func (tx *UTXOTransaction) checkState(censor TxCensor) error {
 			}
 			//check balance
 			if state.GetTokenBalance(fromAddr, tx.TokenID).Cmp(input.Amount) < 0 {
+				log.Error("insufficient tkBalance", "got", state.GetTokenBalance(fromAddr, tx.TokenID), "want", input.Amount, "nonce", nonce, "txHash", tx.Hash())
 				return ErrInsufficientFunds
 			}
 			if !common.IsLKC(tx.TokenID) { //other token Fee
@@ -1892,7 +1893,7 @@ func GenerateAdditionalKeys(seckey types.Key, dests []*UTXODestEntry) ([]types.P
 			return nil, err
 		}
 		keys = append(keys, types.PublicKey(pkey))
-		log.Debug("GenerateAdditionalKeys", "key", fmt.Sprintf("%x", keys[len(keys)-1]))
+		//log.Debug("GenerateAdditionalKeys", "key", fmt.Sprintf("%x", keys[len(keys)-1]))
 	}
 	return keys, nil
 }

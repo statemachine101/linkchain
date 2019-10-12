@@ -51,20 +51,23 @@ function Start(){
     rpcport=$((16000+nodeid))
     wsport=$((14000+nodeid))
     p2pport=$((13000+nodeid))
+    pprofport=$((17000+nodeid))
     if [ "$nodetype" == "validator" ] || [ "$nodetype" == "candidate" ] ; then
         rpcport=$((16000+nodeid))
         wsport=$((14000+nodeid))
         p2pport=$((13000+nodeid))
+        pprofport=$((17000+nodeid))
     elif [ "$nodetype" == "peer" ] ; then
         rpcport=$((46000+nodeid))
         wsport=$((44000+nodeid))
         p2pport=$((43000+nodeid))
+        pprofport=$((47000+nodeid))
     fi
 
     emptyBlockInterval=50
     blockInterval=5000
     
-    nohup $PROCNAME node --home $datapath --rpc.http_endpoint "127.0.0.1:$rpcport" --rpc.ws_endpoint "127.0.0.1:$wsport"  --p2p.laddr "tcp://0.0.0.0:$p2pport" --consensus.create_empty_blocks_interval $emptyBlockInterval --consensus.timeout_commit $blockInterval --bootnode.addrs $bootnode --log.filename $logpath/$PROCNAME.log --log_level debug > $logpath/error.log 2>&1 &
+    nohup $PROCNAME node --home $datapath --rpc.http_endpoint "127.0.0.1:$rpcport" --rpc.ws_endpoint "127.0.0.1:$wsport"  --p2p.laddr "tcp://0.0.0.0:$p2pport" --pprof ":$pprofport" --consensus.create_empty_blocks_interval $emptyBlockInterval --consensus.timeout_commit $blockInterval --bootnode.addrs $bootnode --log.filename $logpath/$PROCNAME.log --log_level debug > $logpath/error.log 2>&1 &
 	CheckResult "$PROCNAME start"
 }
 

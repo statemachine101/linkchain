@@ -24,3 +24,6 @@ tools/validators_priv.json
 wallet/sbin/testdata
 coverage.txt
 profile.out
+test/docker/sbin/testdata
+data
+init
