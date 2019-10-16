@@ -253,9 +253,6 @@ func (wasm *WASM) UTXOCall(c types.ContractRef, addr, token common.Address, inpu
 	}
 	wasm.UnsafeTransfer(wasm.StateDB, to.Address(), token, value)
 
-	br := types.GenBalanceRecord(common.EmptyAddress, to.Address(), types.PrivateAddress, types.AccountAddress, types.TxTransfer, token, value)
-	wasm.otxs = append(wasm.otxs, br)
-
 	// Initialise a new contract and set the code that is to be used by the WASM.
 	// The contract is a scoped environment for this execution context only.
 	caller := c.(ContractRef)
