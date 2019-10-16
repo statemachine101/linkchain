@@ -266,13 +266,6 @@ func (evm *EVM) UTXOCall(c types.ContractRef, addr, token common.Address, input 
 		evm.StateDB.CreateAccount(addr)
 	}
 	evm.UnsafeTransfer(evm.StateDB, to.Address(), token, value)
-	if evm.depth == 0 {
-		br := types.GenBalanceRecord(common.EmptyAddress, to.Address(), types.PrivateAddress, types.AccountAddress, types.TxTransfer, token, value)
-		evm.otxs = append(evm.otxs, br)
-	} else {
-		br := types.GenBalanceRecord(common.EmptyAddress, to.Address(), types.PrivateAddress, types.AccountAddress, types.TxContract, token, value)
-		evm.otxs = append(evm.otxs, br)
-	}
 
 	// Initialise a new contract and set the code that is to be used by the EVM.
 	// The contract is a scoped environment for this execution context only.
