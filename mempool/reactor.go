@@ -117,7 +117,6 @@ func defaultHandReceiveMsg(memR *MempoolReactor, msg MempoolMessage, src p2p.Pee
 		}
 		memR.Logger.Debug("Receive", "src", src.ID(), "hash", msg.Tx.Hash())
 		tx := msg.Tx
-		msg.Tx = nil
 		if tx.TypeName() == types.TxMultiSignAccount {
 			memR.Logger.Debug("Receive TxMultiSignTx")
 			if memR.mutisignCacheRev.Len() >= ReceiveCacheMaxLength { // mutisignCacheRev Reach ReceiveCacheMaxLength Limit
