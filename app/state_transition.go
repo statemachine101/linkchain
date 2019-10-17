@@ -258,7 +258,6 @@ func (tx *processTransaction) transitOutputs(res *TransitionResult) (transferVal
 		if out.Type == Createout {
 			msgcode := out.Data
 			//TODO: redefine these interface
-			log.Debug("vm", "vm", tx.Vmenv)
 			vm := tx.Vmenv.GetRealVm(msgcode, &common.EmptyAddress)
 			vm.Reset(types.NewMessage(tx.RefundAddr, nil, tx.TokenAddress, tx.State.GetNonce(tx.RefundAddr), nil, 0, tx.GasPrice, nil))
 			vm.SetToken(tx.TokenAddress)
@@ -359,7 +358,13 @@ func (tx *processTransaction) postTransit(res *TransitionResult) {
 	switch tx.Type {
 	case types.TxNormal, types.TxToken:
 		out := tx.Outputs[0]
-		otx := types.GenBalanceRecord(tx.RefundAddr, out.To, types.AccountAddress, types.AccountAddress, types.TxTransfer, tx.TokenAddress, out.Amount)
+		addr := common.EmptyAddress
+		if out.Type == Createout {
+			addr = res.Addrs[0]
+		} else {
+			addr = out.To
+		}
+		otx := types.GenBalanceRecord(tx.RefundAddr, addr, types.AccountAddress, types.AccountAddress, types.TxTransfer, tx.TokenAddress, out.Amount)
 		frontotxs = append(frontotxs, otx)
 	case types.TxUTXO:
 		for _, in := range tx.Inputs {
