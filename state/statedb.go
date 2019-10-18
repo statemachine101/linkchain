@@ -19,6 +19,7 @@ package state
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"sort"
@@ -463,6 +464,8 @@ func (s *StateDB) updateStateObject(stateObject *stateObject) {
 	if err != nil {
 		panic(fmt.Errorf("can't encode object at %x: %v", addr[:], err))
 	}
+	acc, _ := json.Marshal(stateObject.data)
+	fmt.Println("UPDATE", "+", addr.Hex(), common.Bytes2Hex(data), string(acc))
 	s.setError(s.trie.TryUpdate(addr[:], data))
 }
 

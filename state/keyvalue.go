@@ -11,6 +11,7 @@ import (
 	"github.com/lianxiangcloud/linkchain/libs/common"
 	"github.com/lianxiangcloud/linkchain/libs/crypto"
 	dbm "github.com/lianxiangcloud/linkchain/libs/db"
+	"github.com/lianxiangcloud/linkchain/libs/log"
 	"github.com/lianxiangcloud/linkchain/libs/trie"
 	"golang.org/x/crypto/sha3"
 )
@@ -359,6 +360,7 @@ func (kvTrie *wrappedTrie) TryUpdate(key, value []byte) error {
 	keyhash := keyHash(key)
 	kvTrie.updates[string(keyhash)] = value
 	heap.Push(kvTrie.serial, append(keyhash, value...))
+	log.Debug("KV", "key", common.Bytes2Hex(key), "value", common.Bytes2Hex(append(keyhash, value...)))
 	if kvTrie.isTrie {
 		return kvTrie.oldTrie.TryUpdate(key, value)
 	}
@@ -428,6 +430,7 @@ func (kvTrie *wrappedTrie) Hash() common.Hash {
 	for kvTrie.serial.Len() > 0 {
 		v := heap.Pop(kvTrie.serial).([]byte)
 		kvTrie.buffer = append(kvTrie.buffer, v...)
+		log.Debug("KV", "v", common.Bytes2Hex(v))
 	}
 	return common.BytesToHash(crypto.Keccak256(kvTrie.buffer[:]))
 }

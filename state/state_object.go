@@ -242,7 +242,9 @@ func (c *stateObject) updateTrie(db Database) Trie {
 			continue
 		}
 		// Encoding []byte cannot fail, ok to ignore the error.
+
 		v, _ := ser.EncodeToBytes(bytes.TrimLeft(value[:], "\x00"))
+		fmt.Println("UPDATE", c.Address().Hex(), common.Bytes2Hex(v))
 		c.setError(tr.TryUpdate(key[:], v))
 	}
 	return tr

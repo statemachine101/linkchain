@@ -592,8 +592,8 @@ func newTestApp(sdb dbm.DB, txpool types.Mempool, blockStore *blockchain.BlockSt
 
 func newTestState() *state.StateDB {
 	sdb := dbm.NewMemDB()
-	state, _ := state.New(common.EmptyHash, state.NewDatabase(sdb))
-
+	// state, _ := state.New(common.EmptyHash, state.NewDatabase(sdb))
+	state, _ := state.New(common.EmptyHash, state.NewKeyValueDBWithCache(sdb, 128, false, 0))
 	for _, acc := range accounts {
 		state.AddBalance(acc.Address, initBalance)
 		state.AddTokenBalance(acc.Address, tokenAddr, initTokenBalance)
