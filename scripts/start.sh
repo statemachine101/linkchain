@@ -107,7 +107,7 @@ function Start() {
 function StartNode() {
     echo "start $proc ..."
     defaultInitSet
-    nohup $proc node --home $datapath --bootnode.addrs $bootnodeAddrList $ext_start_params --rpc.http_endpoint "127.0.0.1:$rpcport" --rpc.ws_endpoint "127.0.0.1:$wsport" --p2p.laddr "tcp://0.0.0.0:$p2pport" --consensus.create_empty_blocks_interval $emptyBlockInterval --consensus.timeout_commit $blockInterval --log.filename $logpath/lkchain.log --log_level info > $logpath/error.log 2>&1 &
+    nohup $proc node --home $datapath --bootnode.addrs $bootnodeAddrList $ext_start_params --rpc.http_endpoint "127.0.0.1:$rpcport" --rpc.ws_endpoint "127.0.0.1:$wsport" --p2p.laddr "tcp://0.0.0.0:$p2pport" --consensus.create_empty_blocks_interval $emptyBlockInterval --consensus.timeout_commit $blockInterval --log.filename $logpath/lkchain.log --log_level debug > $logpath/error.log 2>&1 &
     echo "pid: $!"
 }
 

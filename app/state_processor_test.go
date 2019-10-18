@@ -4,519 +4,195 @@ import (
 	"bytes"
 	"crypto/ecdsa"
 	"fmt"
+	"io/ioutil"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/lianxiangcloud/linkchain/accounts/abi"
-	"github.com/lianxiangcloud/linkchain/libs/common"
+	"github.com/lianxiangcloud/linkchain/accounts/keystore"
+	common "github.com/lianxiangcloud/linkchain/libs/common"
 	"github.com/lianxiangcloud/linkchain/libs/crypto"
-	lctypes "github.com/lianxiangcloud/linkchain/libs/cryptonote/types"
-	"github.com/lianxiangcloud/linkchain/libs/hexutil"
+	"github.com/lianxiangcloud/linkchain/libs/cryptonote/ringct"
+	lktypes "github.com/lianxiangcloud/linkchain/libs/cryptonote/types"
+	"github.com/lianxiangcloud/linkchain/libs/cryptonote/xcrypto"
 	"github.com/lianxiangcloud/linkchain/libs/log"
 	"github.com/lianxiangcloud/linkchain/state"
-	"github.com/lianxiangcloud/linkchain/types"
+	types "github.com/lianxiangcloud/linkchain/types"
 	"github.com/lianxiangcloud/linkchain/vm/evm"
+	"github.com/lianxiangcloud/linkchain/wallet/wallet"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 var (
-	blocksNum     = 10
-	txNumPerBlock = 10
-	coinbase      = common.HexToAddress("0x0")
-	testToAddr    = common.HexToAddress("0x3")
-	tokenAddr     = common.HexToAddress("0x37c9b94a0f4816ff9e209ff9fe56e2a094deefd7")
-	logger        = log.Root()
-	gasUsed       = new(big.Int).Mul(new(big.Int).SetUint64(gasLimit), gasPrice)
+	Bank  []*keystore.Key
+	State *state.StateDB
+	SP    *StateProcessor
+	VC    evm.Config
+	APP   *LinkApplication
 )
 
+type utxoKey struct {
+	Sks, Skv lktypes.SecretKey // secret key for spending & viewing
+	Pks, Pkv lktypes.PublicKey // public key for spending & viewing
+	Addr     lktypes.AccountAddress
+	Acc      lktypes.AccountKey
+	Keyi     map[lktypes.PublicKey]uint64
+}
+
+// without money
+var (
+	Accs     []*keystore.Key
+	UtxoAccs []*utxoKey
+)
+
+type MyReader struct {
+	I int
+}
+
+// TODO: Add a Read([]byte) (int, error) method to MyReader.
+func (myR MyReader) Read(b []byte) (int, error) {
+	b[0] = 'A' // 65
+	return myR.I, nil
+}
+
 func init() {
+	Bank = accounts
+	State = newTestState()
+	APP, _ = initApp()
+	SP = NewStateProcessor(nil, APP)
+	APP.processor = SP
+	VC = evm.Config{EnablePreimageRecording: false}
+	types.SaveBalanceRecord = true
 
-}
-
-func TestProcess(t *testing.T) {
-	loopSum := blocksNum
-	initBalance = new(big.Int).Mul(big.NewInt(1e18), big.NewInt(1000000))
-	initTokenBalance = new(big.Int).Mul(big.NewInt(1e18), big.NewInt(50))
-	st := newTestState()
-	states := make([]*state.StateDB, loopSum)
-
-	for i := range states {
-		states[i] = st.Copy()
-	}
-
-	sp := NewStateProcessor(nil)
-	vc := evm.Config{EnablePreimageRecording: false}
-	blocks := make([]*types.Block, loopSum)
-
-	var (
-		i            uint64
-		bfBalance    *big.Int
-		afBalance    *big.Int
-		toBalance    *big.Int
-		toBalance2   *big.Int
-		transferGas  uint64
-		txFee        *big.Int
-		receipts     types.Receipts
-		blockGas     uint64
-		err          error
-		utxoOutputs  []*types.UTXOOutputData
-		keyImages    []*lctypes.Key
-		blockRecords *types.BlockBalanceRecords
-		amount       *big.Int
-		toAddr       common.Address
-		tx           *types.UTXOTransaction
-	)
-	//account -> account transfer
-	i = 0
-	//{"from":"0x54fb1c7d0f011dd63b08f85ed7b518ab82028100","nonce":"0x0","dests":[{"addr":"0xa73810e519e1075010678d706533486d8ecc8000","amount":"0x56bc75e2d63100000","data":""}]}
-	toAddr = common.HexToAddress("0xa73810e519e1075010678d706533486d8ecc8000")
-	toBalance = states[i].GetBalance(toAddr)
-	bfBalance = states[i].GetBalance(accounts[0].Address)
-	blocks[i] = genBlockAccount2Account(i, states[i])
-	receipts, _, blockGas, _, utxoOutputs, keyImages, blockRecords, err = sp.Process(blocks[i], states[i], vc)
-	require.Nil(t, err)
-	amount, _ = hexutil.DecodeBig("0x56bc75e2d63100000")
-	tx = blocks[i].Data.Txs[0].(*types.UTXOTransaction)
-	transferGas = types.CalNewAmountGas(amount, types.EverLiankeFee)
-	txFee = tx.Fee
-	assert.Equal(t, transferGas, big.NewInt(0).Div(tx.Fee, big.NewInt(types.ParGasPrice)).Uint64())
-	assert.Equal(t, bfBalance.Sub(bfBalance, big.NewInt(0).Add(amount, txFee)), states[i].GetBalance(accounts[0].Address))
-	toBalance2 = states[i].GetBalance(toAddr)
-	assert.Equal(t, amount, toBalance2.Sub(toBalance2, toBalance))
-	assert.Equal(t, uint64(1), states[i].GetNonce(accounts[0].Address))
-	assert.Equal(t, 1, len(receipts))
-	assert.Equal(t, transferGas, blockGas)
-	assert.Equal(t, transferGas, receipts[0].GasUsed)
-	assert.Equal(t, 1, len(blockRecords.TxRecords))
-	assert.Equal(t, 0, len(utxoOutputs))
-	assert.Equal(t, 0, len(keyImages))
-
-	//account->contract
-	//{"from":"0x54fb1c7d0f011dd63b08f85ed7b518ab82028100","nonce":"0x1","dests":[{"addr":"0x37c9b94a0f4816ff9e209ff9fe56e2a094deefd7","amount":"0x56bc75e2d63100000","data":"0xd0ca6234"}
-	i = 1
-	toAddr = common.HexToAddress("0x37c9b94a0f4816ff9e209ff9fe56e2a094deefd7")
-	toBalance = states[i].GetBalance(toAddr)
-	bfBalance = states[i].GetBalance(accounts[0].Address)
-	blocks[i] = genBlockAccountToContract(i, states[i])
-	receipts, _, blockGas, _, utxoOutputs, keyImages, blockRecords, err = sp.Process(blocks[i], states[i], vc)
-	require.Nil(t, err)
-	amount, _ = hexutil.DecodeBig("0x56bc75e2d63100000")
-	tx = blocks[i].Data.Txs[1].(*types.UTXOTransaction)
-	transferGas = types.CalNewAmountGas(amount, types.EverLiankeFee)
-	txFee = tx.Fee
-	assert.True(t, transferGas < big.NewInt(0).Div(txFee, big.NewInt(types.ParGasPrice)).Uint64())
-	assert.Equal(t, bfBalance.Sub(bfBalance, big.NewInt(0).Add(amount, txFee)), states[i].GetBalance(accounts[0].Address))
-	toBalance2 = states[i].GetBalance(toAddr)
-	assert.Equal(t, amount, toBalance2.Sub(toBalance2, toBalance))
-	assert.Equal(t, uint64(2), states[i].GetNonce(accounts[0].Address))
-	assert.Equal(t, 2, len(receipts))
-	assert.Equal(t, big.NewInt(0).Div(txFee, big.NewInt(types.ParGasPrice)).Uint64(), blockGas)
-	assert.Equal(t, uint64(0), receipts[0].GasUsed)
-	assert.Equal(t, big.NewInt(0).Div(txFee, big.NewInt(types.ParGasPrice)).Uint64(), receipts[1].GasUsed)
-	assert.Equal(t, 2, len(blockRecords.TxRecords))
-	assert.Equal(t, 0, len(utxoOutputs))
-	assert.Equal(t, 0, len(keyImages))
-
-	i = 2
-	//UTXO->contract + UTXOExchange
-	//from = accounts[0]
-	//{"subaddrs":[0],"dests":[{"addr":"0x37c9b94a0f4816ff9e209ff9fe56e2a094deefd7","amount":"0x12a05f200","data":"0xd0ca6234"}]}
-	toAddr = common.HexToAddress("0x37c9b94a0f4816ff9e209ff9fe56e2a094deefd7")
-	toBalance = states[i].GetBalance(toAddr)
-	bfBalance = states[i].GetBalance(accounts[0].Address)
-	blocks[i] = genBlockUTXOCallContract(i, states[i])
-	receipts, _, blockGas, _, utxoOutputs, keyImages, blockRecords, err = sp.Process(blocks[i], states[i], vc)
-	require.Nil(t, err)
-	amount, _ = hexutil.DecodeBig("0x12a05f200")
-	tx = blocks[i].Data.Txs[1].(*types.UTXOTransaction)
-	transferGas = uint64(0)
-	txFee = tx.Fee
-	assert.True(t, transferGas < big.NewInt(0).Div(txFee, big.NewInt(types.ParGasPrice)).Uint64())
-	assert.Equal(t, bfBalance.Sub(bfBalance, big.NewInt(0).Add(amount, txFee)), states[i].GetBalance(accounts[0].Address))
-	toBalance2 = states[i].GetBalance(toAddr)
-	assert.Equal(t, amount, toBalance2.Sub(toBalance2, toBalance))
-	assert.Equal(t, uint64(1), states[i].GetNonce(accounts[0].Address))
-	assert.Equal(t, 2, len(receipts))
-	assert.Equal(t, big.NewInt(0).Div(txFee, big.NewInt(types.ParGasPrice)).Uint64(), blockGas)
-	assert.Equal(t, uint64(0), receipts[0].GasUsed)
-	assert.Equal(t, big.NewInt(0).Div(txFee, big.NewInt(types.ParGasPrice)).Uint64(), receipts[1].GasUsed)
-	assert.Equal(t, 2, len(blockRecords.TxRecords))
-	assert.Equal(t, 1, len(keyImages))
-	assert.Equal(t, 1, len(utxoOutputs))
-
-	i = 3
-	//accounts[0]->subaddr[0]  =>  accounts[0]->subaddr[1]
-	bfBalance = states[i].GetBalance(accounts[0].Address)
-	blocks[i] = genBlockUTXO2UTXO(i, states[i])
-	receipts, _, blockGas, _, utxoOutputs, keyImages, blockRecords, err = sp.Process(blocks[i], states[i], vc)
-	require.Nil(t, err)
-	afBalance = states[i].GetBalance(accounts[0].Address)
-	txFee = tx.Fee
-	assert.Equal(t, bfBalance, afBalance)
-	assert.Equal(t, uint64(0), states[i].GetNonce(accounts[0].Address))
-	assert.Equal(t, 1, len(blockRecords.TxRecords))
-
-	i = 4
-	bfBalance = states[i].GetBalance(accounts[0].Address)
-	testToAddr = common.HexToAddress("0x3")
-	amount = big.NewInt(1e18)
-	transferGas = types.CalNewAmountGas(amount, types.EverLiankeFee)
-	transferFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(transferGas), big.NewInt(types.ParGasPrice))
-
-	blocks[i] = genBlockWithLocalTransaction(i)
-	_, _, blockGas, _, _, _, _, err = sp.Process(blocks[i], states[i], vc)
-	require.Nil(t, err)
-	afBalance = states[i].GetBalance(accounts[0].Address)
-	assert.Equal(t, big.NewInt(0).Add(amount, transferFee), big.NewInt(0).Sub(bfBalance, afBalance))
-	assert.Equal(t, amount, states[i].GetBalance(testToAddr))
-	assert.Equal(t, transferGas, blockGas)
-
-	i = 5
-	bfBalance = states[i].GetBalance(accounts[0].Address)
-    bfToken := states[i].GetTokenBalance(accounts[0].Address, tokenAddr)
-    fmt.Println("bfToken", "account", accounts[0].Address.String(), "tokenBalance", bfToken)
-	blocks[i] = genBlockUTXOTokenTransaction(i, states[i])
-	receipts, _, blockGas, _, utxoOutputs, keyImages, blockRecords, err = sp.Process(blocks[i], states[i], vc)
-	afBalance = states[i].GetBalance(accounts[0].Address)
-	require.Nil(t, err)
-	recvToken := big.NewInt(0).Mul(big.NewInt(9400000*2), big.NewInt(types.ParGasPrice))
-	contractAddr := tokenAddr
-	assert.Equal(t, big.NewInt(0).Add(recvToken, bfToken), states[i].GetTokenBalance(accounts[0].Address, tokenAddr))
-	conTractToken := big.NewInt(0).Mul(big.NewInt(10000), big.NewInt(1e18))
-	assert.Equal(t, big.NewInt(0).Sub(conTractToken, recvToken), states[i].GetTokenBalance(contractAddr, tokenAddr))
-	assert.Equal(t, 3, len(receipts))
-	assert.Equal(t, uint64(70233+500000+500000), blockGas) // 2TxGas + MinGas + MinGas
-	assert.Equal(t, afBalance, big.NewInt(0).Sub(bfBalance, big.NewInt(0).SetUint64(blockGas*1e11+9400000*1e11)))
-}
-
-func genBlockUTXO2Account(height uint64, statedb *state.StateDB) *types.Block {
-	fmt.Println("account[0].address", accounts[0].Address.String(), "account[1].address", accounts[1].Address.String())
-
-	txs := make(types.Txs, 0)
-	var serTxUTXOToAccountOnlyTransferValue string = "f90b3d80f84a10c698b1d37308f84180de8202308201768203448201c28201bb82033481d382016c82059582020729a04ba2bcea3435c6becdaf044f578faadadc3086359aac91850c347bcc99d73644f86fc77cca059e4aa7f83c947b6837189a3464d3c696069b2b42a9ae8e17dda18405f5e10080a0b84f4ba682f169b3b91e7ae28d38daf6640b7ad7c703f026bea1975ee510f1a45842699137a517e2a0ad852eec1151adcff0db94cad0ed8def22b9e85afa1994e159cd26646550d40f809400000000000000000000000000000000000000009454fb1c7d0f011dd63b08f85ed7b518ab82028100a061c8f12510c990695497e8db181a2a60c5670ff6c35d9ee61137b108db7270228405f5e10080f84582ec8da005376bfa0f1c247315bf7153f9e184451ca0293e0fc49f8fc7df04f5732fdb86a053d7575c6faaae60e681cd8d85b913e4b39d052bfa911ed331ef566374ed1499f909e4f903c303a058591aa39a11ff3408419044190d1f1c78e8870e9fb4f46e2167431dd96527ecf902eff902ecf842a0246ac43d9a885e03355830c638a8eda22c93be7128364918cf9cf9beadf1e5c6a0d8fc7fd88c43a1b296cbd26ddbe95bbd0a06867b0400df631f281a0c468b4984f842a088a1bbfba3d9576b310cd746772d7c7baa9f3a0244ee1f0504478262ec73b942a0e69e74e0ba302d3c2f5ab496d2ac1880077d4ea3e36584453acbd5c5dabb04cff842a0f9b59b309733938e124ebd035014f06ecd8b7caaf9a35fac6c168bdc55569feaa088506386a7329f51448a4ff48009e7a4016578610c0311ec1e499d690839fee9f842a09dd2161f837016abaeb4c1483c6d251a025b8e8a474fcda03bcb37cc62cae163a0a9435f034a0d805f27fbc9050166401ff38afb0510d629dbf9c7206b39577746f842a0713608819469ea83bfa9d82ab4d4e0628f4302a70502d865367380c5114fd684a0074e3bad7396553ae860289c1a5a6d1cbe92154a701e064255a17af48575d51af842a0261d6d3cdbc606a12c9eddb673aaf8ad8fed78e0121dbcdc2f3af0e923d6c419a0d1e384986f3eadaeefc09dbb9e707c1c184fc71a3b7f31e8c6d56905e40f705cf842a0f7e132ebff6ad453be59ab73e14605d0b568f3a458131367b0783e455cf678a9a030f6d6bb3a397ac26a3f33e797d992f4b63dc6a34d23839d76b150da76fc7858f842a0bbce3a3462a0943411f175bae25c4d3eaeedeab2c0f91775eef2bad781fea5c3a03af0386c66012383b3fab2b2f78d1810ad7816906ee2944cfbdcccf626047710f842a0703ea122b7ab7597748a1dfb9098d044682403cc6628224d2282b2cd738c957ca03c5f2d350c01a39b684ab87c1046ead63381876414c38c4b7d7b80c3af169e97f842a01b5a616588c1fcda21fc154150ebe7ebc54c51863037f3caaa65f59bc1e482f0a062d8777665e1d1f9486b54e2640ecd7ccfa700797e04f8793717e6f26b45a9c0f842a01bad937874d1168fcd8acd9977e49ee86895c3b693f0b47bb26eaa634eb57182a06ba90daa26fd3cc766a4af691aadd16cf765b15974b2007bf4a8e97f4ad82118c0f865f863a0f0229c9dee191ca104d403e708010f71959c15582e89fef9a0dab0d13aaf9f0ea0896a27a47591ff726faa1aa4e436231e91b6b815ec76f1816d516d3e9da37e00a00000000000000000000000000000000000000000000000000000000000000000f844f842a00000000000000000000000000000000000000000000000000000000000000000a0232ec65bf43a4b5ab436988fc82ac55075835cf88fce1418e08b9bfa343f706680f9061bc0f902bdf902bac0a0a33e9cdfec0da5cdfac403a303fcdebb603fa755980c1998d4e3de8378f39806a040dec11d61571deda397118a45c255c445e3fa9c196f0174a8071f8fcbfb2ceba0a7d2f4303ce4354ee36d115cf57362278461719b88510a6ab4cf2e89964c2e74a0190e254edc3bedb057c75575607c7145230b92258c2760d7e9bff80ae675af98a0be5ad88fb50773cd8debcc200343ab2db202d88eb6accdcfbc445ff3b381280ba023199532e2fde0f17fb9bb800bb579b5cca88bfa1139eb7e3fa937aef1fda900f8c6a0747a45d5709909d9eb44a988939140f742d769f5a1ff1f55506b81153f79509ca0a5aba63f008a8889ba8b10b8acf497fb042691421fa6e85cc41c01c1e8086c83a0f070d9e8df9200435a99392f99747eacc3870ce64cd4981d765304e5e3afb8c8a066a75d8aa2968abd09377bb8f65c8233e51ed896ff717710b59d2f365c0e8d60a087de4aa1e29be43fe419475bba4d46d8ca1d6d73a882d1e8c8a922e34bded996a04e73b426afc8e19265c4fcde818eea99c676a82ca392298d0e7895a07d6cb956f8c6a0aa5746afbb4b9dde55786a694a9714146782e47c724443ada3e9b23a581e7822a02efb62c2d7babbd6da7cc55963fd837fd59ff73a24090ca48a53aa8964ae8a6ca0cc388d8c0a3bb84b66faa8715a39eb9481640ef6512e297f87139775b290e24aa0812937f8b9797ba3dcfae818e888bf12ec5b13ce53dc6e433a2e78ab2d5f81c3a04f0c37e9c54a27d9d75ff8650acca2a252e03e22679102cf130e053df2a500c6a015ecb49eacef8e86e57e9a1bce0600911521c4189582e63ca2ec60c74f450faba03d15829f956b2dda5b675f56acd9c1315f569479a1a42eceaf585e549d9a700ba08371039b5692d00fc0d32cd7ee1309e980f4ffaa115f76ecd6eadac03b68b504a0fe546b55b67ad1d73a041767d654633b8bd1b0f67945418bedededed6c44e000f90335f90332f902ecf842a018da924ae68dff868b8a6a9aa7dae0ec801b983ec270a08a59a29b510d234906a07d8c68f7647f7ab8c05939d2d6cf3b725cc4f56fc9a247b4c292e86a0fa2b903f842a0b7e891ac0c51e1412413e779714bac7e192c873877a382a1bfc4b6bd299ed407a08600be0e8c10d9816662b07201457e2a1e76d54491bcf5ea21274abce1c0ec07f842a07e47801300537bebf45ee7145cbfc76d08a14773d8987cf99b60521fbd51250aa0b69b68806a08a193686d5a316d946188c5b140d378dd4c72aa0ef7c971f10906f842a0e5d0d2183f99767aedcb2d13544ba397ceae704da3c6bdd9564a4427d3830603a0238ec631b76c736feac0a799c3a111ab4ffcaf47ec4ef5f50817359841d9f506f842a0569aa38070fa6a35b344fc51157eadc106d4b240b62b1b1780c46d0819006f09a02a97dabf797c3b29f9e33130e58d991003706b27bb138e2a12491a85aa59410ff842a016aa308ade52e4a72fc21fb53a745fb93c7b800e6916249b45d81e41baad0705a0ab08073b6a04b71a78a6ed7aa1f150ec7660bee82558a189e403ed50e63ea508f842a096381444bb3ace25d4be114f64a00629ce17ff1ef1e8fcd4a03e109d292b830aa0c022397061b84105413cee30a492cea8b74592659af2f5c8ec3e864da5e29009f842a073c4be6c8dbc4fb1cff31fd48ccbe456c58627b9dd31d0593a77aefe0f7a5208a0b4623b66862159732dca641ce261a70d3782999ccdef33a7bc8e140952347600f842a071ba79e33bc907e98455c688c352dd63ede3f3a395e76e709cb6e46ea3ad100da0bfc8c9d4572bbe2c20e68c1628bbd2bed3d9943ed116851d06f05d00ca4a0d08f842a0b5767e45ac8622280458277b5461d2ccdffd75676a16604c9f4ac948a5366d08a0bff2eea7e3f2a502b032279a515c52a4b6c47e87dadecc402760c1ce1dc6a80bf842a05c81ec5f380b457e844b509b6508ca6625213dd5c7b2baa8231e2def8e676600a05cb91a4100993d0b15472ea672f3be71117349e9cfdc42163ab0fcf7ffd3e909a0a27163cf17430323a67d93015ef2837a2db3b74d0008167bf59c46839d75b30ae1a04ba2bcea3435c6becdaf044f578faadadc3086359aac91850c347bcc99d73644e1a00d8178b01b8b6705f2cfb1eede5a2e059d3604b58fe33a1de4d3af56a176860b"
-	// accountOutput.Amount = 1e8  Fee=1e8
-	utxoTx := genUTXOTransaction(serTxUTXOToAccountOnlyTransferValue)
-
-	txs = append(txs, utxoTx)
-	/*
-	   if err := utxoTx.CheckBasic(nil); err != nil {
-	       log.Error("CheckBasic", "err", err)
-	   }
-	*/
-	block := &types.Block{
-		Header: &types.Header{
-			Height:     height,
-			Coinbase:   coinbase,
-			Time:       uint64(time.Now().Unix()),
-			NumTxs:     uint64(len(txs)),
-			TotalTxs:   uint64(len(txs)),
-			ParentHash: common.EmptyHash,
-			GasLimit:   1e19,
-		},
-		Data: &types.Data{
-			Txs: txs,
-		},
-	}
-
-	return block
-}
-
-var serTxAccountToUTXO string = "f904b580f852cf4852c16c3232f849808502540be400a06cb74a2e1cb5c80076f0f3241cb17ce4a1c48a5aede9d3d5c46eae24ec1fc501a0599fbe47523a149a1ecacf7f1666ee90acf23daf8e61e224f6214536bcea88f2ea5842699137a517e2a082090b2fc114929526393191840d06a56b593e9ad3b1dfe00c14387fab0292ab809400000000000000000000000000000000000000009454fb1c7d0f011dd63b08f85ed7b518ab82028100a08d2e746c2caa306a57ea3349ddd4e049933065f50c4a01314b9994d29143f0ea8402faf08080f84582ec8ea016eeb095fc1f37e3c8004ae2f89bb1d0d12a892c8ef38685ec42a2e7b6f2b25aa06b4bcf38a5defd312218ad5948cb4f54524f10f2d3155afc56441797c216019ff9039af8d280a00000000000000000000000000000000000000000000000000000000000000000c0c0f865f863a00000000000000000000000000000000000000000000000000000000000000000a012e4c14bcbcc79ef000000000000000000000000000000000000000000000000a00000000000000000000000000000000000000000000000000000000000000000f844f842a00000000000000000000000000000000000000000000000000000000000000000a0599fbe47523a149a1ecacf7f1666ee90acf23daf8e61e224f6214536bcea88f280f902c3c0f902bdf902bac0a0e181ef4ae2511ea6db183eeecdf1d5510d224ca24331bd51e53da0889ac7cec7a0fc780fc612127862679cf3c15438db9253e992ce9670f05c0a028b0aa5a824d8a02c10fb57e73c19fbeccfb221d14abcb3e6499d4d48f53d35a56948c57e1a3b33a080144cc4b35cf42c7d1cba7204fe52c3f4cbea36274dcaf0540f67d2a82b0062a0482d25dbe62ef856469579255f2bf4b39342155c5ce0d8cf19134cfcf3981e09a070a32d738eb7bad948d65c2263366afe6855906ff6bc66cdd6f5a38fd3c4c008f8c6a0900a60686de972bfce2ba8b83549a1926ee8119f05e5b569d7dbbf3026f8fa3ba096b35acde266555b1198af0665f9deffb50301840eead9d3d764eab42068b0f9a07515d1af6f1a7ac4873371ecabc698238cf20d372800853d90bede6c36a13da0a0860ec7842ac816113918f4079cc8ba85c6f77f0b59b378a7d7c6aeec4135722ca0c4edad0c7943aa6dc414a59cf9bf7ffb206524419cb90b3f0ade70bcc3c23bc5a09aa20f613594ea6be45756c015f116d4b7bc0b1368bfdfc57c96f4810c8854c7f8c6a06a3e6ac018fae6efba95ab0e3d0a8d4ace65faf3c42bbd7c3fdad4d6ec35f1e6a0373a4c2f47f2fc8ad338941a2d30dfccefde1834aec9c8cb5b9b1ae24e0bc119a03814145be55ad6ee20ef23c69bc91ce0dbe95218261c4040e8c3a2bef3266398a01479172a4f6b8f2876c0ed36be225c11e4ac5ef131acc85b84cf7024633592fda0ebce563708c22d4f06062166acd2d12a5e6cf7c13da5473f2c096f02098b8271a0a92a8e52e90be9cf18e9e5d83244f1c0d48099b198d9b46c2ac9094b97ad3d2ea05c78b57e48772a917c7eba996d10e5f2acff0150ad4056c5779047c12869b807a07bacfbc8c9ab1fbf9c2586d3e318b3a512399b2023e08f58ea9b4d489450b60ea0782aec3f31e1d8269130f1f71cf89294bdfceb6c7cc2dd6f0218112219c4130ac0c0"
-var serTxAccountToMix string = "f904f280f84dcf4852c16c3232f8448080a03745b1b5386568c5c9b224750641bbf64ea451dc9417dea914b8df4ff248330ca007880beb05ff90bbd335420174b6f07c47c2628985fe4ca6e8da7959dedbe762f86bc77cca059e4aa7f838947b6837189a3464d3c696069b2b42a9ae8e17dda18080a085598d81489afb5283fddcfb9cddb6a81b85ae91cbec9f75fb036238f50725895842699137a517e2a0742d3c403cdd70c25a8555f201a8fa1fe977ef96873f7817f4efda0e91cdd7fa809400000000000000000000000000000000000000009454fb1c7d0f011dd63b08f85ed7b518ab82028100a0cd970cc7b1f205cf46f0a569415a074dda48dc0f77a841a33ac600c3f547046b840773594080f84582ec8ea0152b35d3621a3ea7e4ecf579cd8b4398fc23b60629d942e287dd8266d654c7d3a022c60a440fa92e3fcc1dfd3cd1ab877326bfe23ffdc1d5973ff9259185691af4f9039af8d280a00000000000000000000000000000000000000000000000000000000000000000c0c0f865f863a00000000000000000000000000000000000000000000000000000000000000000a05ffb3600ddf3d01a000000000000000000000000000000000000000000000000a00000000000000000000000000000000000000000000000000000000000000000f844f842a00000000000000000000000000000000000000000000000000000000000000000a062f3347eb0218a1f5183a00fce1a7cdbbec5f3fe81be877315950baf013ee05f80f902c3c0f902bdf902bac0a0cc292034fca200f0a3b3aaaa63a52a7bd8ced893ee63166663125e7a882b23d9a03d81eef71a3a4c95906291b074fcd5e1196e40808d9b509a71177a4390a477a2a0a80172c15aa71dfb08ac5067661992f5f926d4b55142be82ed3d50fe7dffbec7a0dc7eec0dc68b532574acfabab1db5d8d1a034cb0e698a547bfbb74c29b182684a060f8df28bda1beeb1d55fc79117c8fdb0ef6f090561a129e6a1031a44d0bdf0ca0c39efbe4484cbe50a156dae824d01ccb6fe0e049b6d3803c03f25394d453990df8c6a0f20013639c922f13f7080606cfa8d4adf001092fff78c4b6ff0261588028efc1a0ae366d7434cc6eef59e3fab99dacbe6efbf09b03e372b208cc9af024f095b4d0a02fd683703d04d44705a791cede2a3d067aa3daf18e2f840f84a38a95da1ce6fda00b55158cc7c19dc0e4999c28c0eb39eb16a4eb88a85d8dc76742eb1d8a12afdaa02de8c8508784b6df1b40e34e7f2eef1211946e3ce84dbee0ae6f44b57fb43c78a09d50771db9468dba6ebdd0cf639086a75900bf893604cd5bb28c9e5b835e19c5f8c6a03c842fd3becbf562ca9bc00ecc715e7eb50b1859ea6386741208a1104c1a5624a073fa56bd57"
-
-func genBlockAccountToMix(height uint64, statedb *state.StateDB) *types.Block {
-	serTxAccountToMixTransfer := "f9065e80f854cf4852c16c3232f84b808701c90565ffe800a07a3d100a86f9bd1bda36bf974efb5f0ae33ca9da38d70a43d568e1547bb03306a0b55faeb1418d1a887475f20041cd8a8d184b799b03bd550da8875312b2ba20aff8e2c77cca059e4aa7f83e947b6837189a3464d3c696069b2b42a9ae8e17dda1865af3107a400080a0e70ea715c1e0cfd7145f496dd20ea10e991d678201c7d0f2df4944b3685b13e1c77cca059e4aa7f83e9408085a83232c4a3c2f9065f5bc1d93845fe8a4b586886c98b7600080a0d33d44d8ea542372c86c7f3397a7a9f8edb325f7d8cda12aec58b986baade4915842699137a517e2a0abe1734267929b878335827b1fcc751050baa7cc85feeddcdff7dd49cf2132d5805842699137a517e2a0da6774080cd4c4b4ba6224b95695d7011cdc4879503c268b8e327e951ef5654c809400000000000000000000000000000000000000009454fb1c7d0f011dd63b08f85ed7b518ab82028100a017217ff459b7d3f16b68bf987c7c7226e69a81aeadb3631980660334ffaca57f860246139ca80080f84582ec8da03d65e2427fac8bc2c3bb69990dbdcab1684de969bbabd735361737785a9f6ceca01848204165004a1d81e03fb49c693e245db0c31b4deeabd236353198f0118693f90486f9017b80a00000000000000000000000000000000000000000000000000000000000000000c0c0f8caf863a00000000000000000000000000000000000000000000000000000000000000000a05afd76f3b849b6e1000000000000000000000000000000000000000000000000a00000000000000000000000000000000000000000000000000000000000000000f863a00000000000000000000000000000000000000000000000000000000000000000a096c27196aac98d5a000000000000000000000000000000000000000000000000a00000000000000000000000000000000000000000000000000000000000000000f888f842a00000000000000000000000000000000000000000000000000000000000000000a0195fdd0108e4bfd66d0fcc21e8c1d2c2e7435f6bba58ff376ee741158f3f77bbf842a00000000000000000000000000000000000000000000000000000000000000000a06e388b862f4580bb976eb81497231cef8ba5e378e5e8321cf2465b4b3b4ffe2a80f90305c0f902fff902fcc0a0b399b897b7376f0beea319f0b22581d3fe88e0b250ed8e55c684198b754304e9a0a86e1e57fc5de6b0745aa533a90f70fd4c0788c24f88fb751206ea23596235f4a07409e4bf35b871c931542664140821743f92c4393beaa20487852f2d67d81ac4a0f1d73aef1f4216bdc24bb6a185a9b83c6ad0645452ed2f7d267c25a2add507e5a0ee9faa0dc5fbef1fa9e94b2fd21ae910877e14b8869a1383264110cda56e740ca085c7009f262cf367fe091b0a73f9051d9018d29b4924f5b81fb65dc89f66b400f8e7a0da0316f198b19b927699e09dddc6dea20f6efaf1e48a50b814527901d1a4c409a014742be152a4d53405411d0eff7150ce279c72d41fc881a1995f044106a44f99a064ef9a300476293cac8f263a79ea50e3a4307dfe996626a203a342b0acd9b818a04ba93ef6d5c99325934de8cb567c51e24e31d6aedb28d796f26fb1d3c8acbf03a07b083680ccaf346c8a6cc92ad7eea26e4bfe53d569f01e4d58c5ee05f1367a92a02abd09863923e259cd437daf10069c45cce15038e103cdb8cb4e9a431304001da00b62c66e4bad1541bbaf43843dbd37c1ba69aadedc4274099ec279856cf02714f8e7a00c224e0c06a8c6880bc197304d126b0ef0fff97e485c9bf537c92a797439f2cca052ebfb437b60295d7e6c3d580e3c139b2218b58152b9935b3a199d81e75b5e39a02c1ef05d6982a2a64402edbc14508fb8d3c6073e0ba596c9853322ea47f5b3c3a0ddb2cee14c277c6c584af11d954bac7ebdcced29b5f2ef3093371e58c9c2e40ea08e2aa37c1e013f8770706f2c000b56ab726e6b769266a3f78f2bdd3ebfb1918da0a3d10fe1087f27f4790165ce9606adba2ed74d2bcea3abe6a45bb9584e517134a066ed1a45cffd6a9c990e1d12f71b12fd45945f03c35a51924688ae3f70818933a071d3871b301dc1bf08afeed990a2b151e0b771f85ada4f5ec8cd9a26522bd90fa01cdf07649bdbd0165aeb0ac5a560ec7f88bd4a997acaee2458e944a0103d4c09a08ddcb56efbf1ed1fe92bda206996be649d5db7eac78ceaa4fc067b409ec63a02c0c0"
-	// From:0x54fb1c7d0f011dd63b08f85ed7b518ab82028100 Amount 502500000000000
-	//To:0x7b6837189a3464d3c696069b2b42a9ae8e17dda1,   Amount 100000000000000
-	//To:0x08085a83232c4a3c2f9065f5bc1d93845fe8a4b5,   Amount 150000000000000
-	//                                               Fee       :2500000000000
-
-	txs := make(types.Txs, 0)
-	utxoTx := genUTXOTransaction(serTxAccountToMixTransfer)
-
-	txs = append(txs, utxoTx)
-	if err := utxoTx.CheckBasic(nil); err != nil {
-		log.Error("CheckBasic", "err", err)
-	}
-
-	block := &types.Block{
-		Header: &types.Header{
-			Height:     height,
-			Coinbase:   coinbase,
-			Time:       uint64(time.Now().Unix()),
-			NumTxs:     uint64(len(txs)),
-			TotalTxs:   uint64(len(txs)),
-			ParentHash: common.EmptyHash,
-			GasLimit:   1e19,
-		},
-		Data: &types.Data{
-			Txs: txs,
-		},
-	}
-
-	return block
-}
-
-func genBlockAccount2Account(height uint64, statedb *state.StateDB) *types.Block {
-	//hash: 0xa6c0a339b527210528c0c56ec457c01ba97bd87ca33fd396a243dd48d03f15ba
-	//{"from":"0x54fb1c7d0f011dd63b08f85ed7b518ab82028100","nonce":"0x0","dests":[{"addr":"0xa73810e519e1075010678d706533486d8ecc8000","amount":"0x56bc75e2d63100000","data":""}]}
-	serTxAccount2Account := "f90139f856cf4852c16c3232f84d80890572b7b98736c20000a00000000000000000000000000000000000000000000000000000000000000000a00449c9d0102bfb7232c1655f4833e60f1aef38ff2b9a535678debea611f2df97f84ac77cca059e4aa7f84194a73810e519e1075010678d706533486d8ecc800089056bc75e2d6310000080a04b1651c5abb75479ab0719edc3a221be8607e32ebf1b3f45a0b4db3348ca625f940000000000000000000000000000000000000000a02e16c7e81ec6dbd0577537006734f567063023ae61b265510fc8a0a449c8a779c08806f05b59d3b2000080f84582e3e6a0054ce9bb1f7944fc3af519780f28c9e5240ab2f2555570ccb937a4900c1a0b36a032577ac35f69ce2216119ee995080e46f9e510f2ce2c5bc0475791de7d6f88acccc580c0c0c080c5c0c0c0c0c0"
-	txs := make(types.Txs, 0)
-	utxoTx := genUTXOTransaction(serTxAccount2Account)
-	txs = append(txs, utxoTx)
-	app, err := initApp()
-	if err != nil {
-		log.Error("initApp", "err", err)
-		return nil
-	}
-	if err := utxoTx.CheckBasic(app); err != nil {
-		log.Error("CheckBasic", "err", err)
-		//return nil
-	}
-
-	block := &types.Block{
-		Header: &types.Header{
-			Height:     height,
-			Coinbase:   coinbase,
-			Time:       uint64(time.Now().Unix()),
-			NumTxs:     uint64(len(txs)),
-			TotalTxs:   uint64(len(txs)),
-			ParentHash: common.EmptyHash,
-			GasLimit:   1e19,
-		},
-		Data: &types.Data{
-			Txs: txs,
-		},
-	}
-
-	return block
-}
-
-func genBlockUTXOCallContract(height uint64, statedb *state.StateDB) *types.Block {
-	txs := make(types.Txs, 0)
-	nonce := uint64(0)
-	demoTokenBIN := "60806040526012600160006101000a81548160ff021916908360ff16021790555034801561002c57600080fd5b50e4801561003957600080fd5b50600160009054906101000a900460ff1660ff16600a0a61271002600081905550600054e07fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f60003030600054604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a16107eb806101436000396000f300608060405260043610610083576000357c0100000000000000000000000000000000000000000000000000000000900463ffffffff16806306fdde0314610085578063313ce567146101225780633eaaf86b146101605780635d0268e61461019857806370a08231146101b8578063a4556fce1461021c578063d0ca623414610226575b005b34801561009157600080fd5b50e4801561009e57600080fd5b506100a7610230565b6040518080602001828103825283818151815260200191508051906020019080838360005b838110156100e75780820151818401526020810190506100cc565b50505050905090810190601f1680156101145780820380516001836020036101000a031916815260200191505b509250505060405180910390f35b34801561012e57600080fd5b50e4801561013b57600080fd5b5061014461026d565b604051808260ff1660ff16815260200191505060405180910390f35b34801561016c57600080fd5b50e4801561017957600080fd5b50610182610280565b6040518082815260200191505060405180910390f35b6101b660048036038101908080359060200190929190505050610286565b005b3480156101c457600080fd5b50e480156101d157600080fd5b50610206600480360381019080803573ffffffffffffffffffffffffffffffffffffffff1690602001909291905050506103b0565b6040518082815260200191505060405180910390f35b6102246103e8565b005b61022e6105cf565b005b60606040805190810160405280600981526020017f44656d6f546f6b656e0000000000000000000000000000000000000000000000815250905090565b600160009054906101000a900460ff1681565b60005481565b3073ffffffffffffffffffffffffffffffffffffffff16e273ffffffffffffffffffffffffffffffffffffffff161415156102c057600080fd5b80e41480156102cf5750600081115b15156102da57600080fd5b7fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f3330e2e4604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a150565b60008173ffffffffffffffffffffffffffffffffffffffff163073ffffffffffffffffffffffffffffffffffffffff16e19050919050565b6000e41115156103f757600080fd5b3373ffffffffffffffffffffffffffffffffffffffff163073ffffffffffffffffffffffffffffffffffffffff16e4e37fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f3330e2e4604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a17fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f303330e4604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a1565b600080341115156105df57600080fd5b6002340290503373ffffffffffffffffffffffffffffffffffffffff163073ffffffffffffffffffffffffffffffffffffffff1682e37fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f3330600034604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a17fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f30333084604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a1505600a165627a7a7230582035535fe5dabdc379daafa902bd1a8b41026cc07fe489cad1a962214b964671dd0029"
-	contractCreateTx := genContractCreateTx(accounts[0].Address, gasLimit, nonce, demoTokenBIN)
-	nonce++
-	txs = append(txs, contractCreateTx)
-	fromaddr, _ := contractCreateTx.From()
-	contractAddr := crypto.CreateAddress(fromaddr, contractCreateTx.Nonce(), contractCreateTx.Data())
-	log.Info("genBlockUTXOCallContract", "contractAddr", contractAddr)
-
-	utxoCallContract := "f905aeeb10c698b1d37308e3c180a03b0947117b33cebd8fc22e26cb203d95f0ca5c3b11d0b6843b387a7fa5290829f892c77cca059e4aa7f83d9437c9b94a0f4816ff9e209ff9fe56e2a094deefd785012a05f20080a0ab039980de18235e5fd3e89fb5999fbb7f6233e73981ef146d0472930b7068315842699137a517f843a005590df2358ba38889df848a79b07dd288246bb023356955e82ced56e67ef74980a01ccf4a4079c4ec97e51be09a9230475d326d5268887e99b965c1253ac8ba02ed940000000000000000000000000000000000000000a0cf95284e03a673acc0c99c5ef41bd519eafb19d50742b892af1b4a060b63a5f9e1a0070d50295717399610d976259cc878356412ee51b84f8a51692ac98d7aa150ee87b91c4fdb60800080f84582e3e5a0f2226baa77cb1fe182de8868ec8b7dc80269b9ba9083513b83479287a9f55c9da061dd4ba9549b5ca8dd18862be8009fcf8537eac91851fc9e6d02f382fc8688cef90443f8b003c0f865f863a0d21d19150211ef30e296fa502fda52c643c38b6cbf4cef03d09f6c7b6ca87c0fa0517e2473aa2c06e40f5ad7af5cf6864ae96b9ab74a978fdff2e8139b9c1de004a00000000000000000000000000000000000000000000000000000000000000000f844f842a00000000000000000000000000000000000000000000000000000000000000000a019574676cedbe237faed66ecaafabf3382bb9db163bbd86ce0408f8cf773f71180f9038ec0f902fef902fba067e5985fa37c9f0f361a11b2b174182f785528d51b6546b7141d0d0db271985ba0751c95495c3821e246df9ed4bfc43f5f3dd46b54a7ef98d6050b1967030a5735a05a8d9a76d6a93a697b243b2c9f66b14294dfc7afccc854297f7091ca64f2a969a01aca5c48a33a8127ae58b4491c4730653bee98df4d5ce84a9d02ab55486b4b74a037ca8238236b5998769a19170a9097f4fdf0bdc7fe135df18f3007848908c60fa0eeaf35c3e5b2fda5b93dd7eb5bec9a4ed0292938f986baaf00d37cce969e8407f8e7a0c8868fc4570c9e4866da08db338f9d6f0bac3850e1acf867144e62e7dfd5f5eda0387f00627937a6d67d2633eb2626cbcac79e3a6898a74994e706d72afc6a6ae8a063bd824073f905817d27cb9935330806feb0e4d962ef903466f540e52c5ede4ca06d2c5d83c52dfcb2db03136a01e612115ce9948c255b2677ed7e3e0d47f2ebfaa033666469052b3ceb6368a2be0661e5a05240ff1f5107a078c4565fb7d7ef2810a0ed76ae50b191d4374b28b019a034fd8ae21ff7f2553e4d053457acec68d21879a016e650415a5b7272f1408f7847150c8a69961132392340a5eddda91facf9fcb5f8e7a0ce4b67624309d62e704401e6b6cc27dfe2ce5d0b9ae8802a83aaee8bee0bb773a02e66f8141074ed6429aebffced2b22e571e96c40e0d4860a87cf6f52715b14d9a0cb4aff8ec9249014dadb077ac1988aff888789e79bf55f37da20b58c0dddd7bda0b3ca1aeb0f366248a967e853a023671d5af7bde28246d06ac5c3d3e0e13f6e04a0b5074a34f8b046e64aa19d1374904aa13a4c02dfdb5e335185e63c0a898fea85a087edc7dfaecf5fed3b8d31609de81e2c18c6fdc2ac9f6e597a72ed0642b8709ba0ec1399c9c00a45157d000c209a9a1a1f8dd386f399b3142b311b4334153c3dcda0d1e6fe08ed8d80afcce4101515d9f72e31724c53ebc95506ad62b06e8a77ef08a0e222fa5ca652d91fb75865f3e405e429145b96b335f6a594dc6d359c7afefa09a03821bda8d286828f59eff85c16999d1529ca4528d995246b2899b05847a02a0ee3e2c0a00000000000000000000000000000000000000000000000000000000000000000e1a0ef8d7abad7a9c6f97027aa570da72a8d1f4b364fa9d5600c5db8cd9bb3002da1f844f842a07b6b27b1ecd0f8c77003c87e9e90a029db188de403218de0c0a87be6e6ff1005a05d99aec15b0a07a5e0cb35c28ed79926db17a1e486bc9e4e69fafee38d97ad08"
-	utxoTx := genUTXOTransaction(utxoCallContract)
-	/*
-		app, err := initApp()
-		if err != nil {
-			log.Error("initApp", "err", err)
-			return nil
-		}
-		if err := utxoTx.CheckBasic(app); err != nil {
-			log.Error("CheckBasic", "err", err)
-		}
-	*/
-	txs = append(txs, utxoTx)
-
-	block := &types.Block{
-		Header: &types.Header{
-			Height:     height,
-			Coinbase:   coinbase,
-			Time:       uint64(time.Now().Unix()),
-			NumTxs:     uint64(len(txs)),
-			TotalTxs:   uint64(len(txs)),
-			ParentHash: common.EmptyHash,
-			GasLimit:   1e19,
-		},
-		Data: &types.Data{
-			Txs: txs,
-		},
-	}
-	return block
-}
-
-func genBlockUTXO2UTXO(height uint64, statedb *state.StateDB) *types.Block {
-	txs := make(types.Txs, 0)
-	utxoTransfer := "f90680eb10c698b1d37308e3c105a080d41f601eab3eebe2397a2938be98c4a98e4badcf244add946b2ef5b1f844e5f8985842699137a517f843a0da9cd7a485e127d23003ef119ae963feb7339dda8bcd8109bf4566da4a99bcbc80a07f1feb0fbb72ea475ca91b5fb5698f935883b1407c547695eaf485a70d611e095842699137a517f843a05406b9bd306a86e625d9c1e6388f4e77b5e4b893be1d9cf9f741070c47492c2380a0df72b9079e0db178e71a2b4242876db3295661c6460079ad35f7acd794bb3ef7940000000000000000000000000000000000000000a029be69490a29813f9ec025771df4a5e777d3ad1990d9978c70c04093878b8031f842a0852e682a2a2440284654430dfd73f6cdf564f94c519145532a9d9e8be0df5982a06a3c76405cc0755a94df3526c836eb2949b1c04c7f88149561ea6c2720b2f18b8609184e72a00080c3808080f90531f9015903c0f8caf863a0b36d8e31f375888dbb80333ad59273dde2f27556ca396b1280edb5424839e500a09ff27c0b11e162b36fc863142fe6f56aa97230887a036795081973d8ed3e6f0ba00000000000000000000000000000000000000000000000000000000000000000f863a00d7d6cea26431e97ecce37044b35f7958a6ae271c34f7032aa79d0e19ff93e0da09cfd3572e8bcc609e416293eb9c37489813cbecb8616157a7be500f39e031300a00000000000000000000000000000000000000000000000000000000000000000f888f842a00000000000000000000000000000000000000000000000000000000000000000a0bc6b3e11d16de5441a0090bd3ce76d08780436e737992b115fe6669381acd022f842a00000000000000000000000000000000000000000000000000000000000000000a044de947b1c6ac75da05daeba3447de9dc1a8ae9afd64ee2683bc051c53d72ae780f903d2c0f90342f9033fa09f822a7c4df5010fcafbca690b78371d3807e1faea1713e7cda27f3afeb8b4dda0d957582dda65bc6200b0f45a9069513ecd5e109096a9d740d7f0fa5618f1c64aa036bc9eeed036c3c648e42bed0977881822072bc98d795124b6d9e7582a37a3a3a09ea2518bdc5d7da3f6b17de66aa7631ae20aa2811d11c3332356db603c12a0b9a0a32783e3a2bfb47bcfd41428116898b498fde146c187b7a2a1a4d32c453da206a0b33a02366a45f44f6fec27da76b06beed20a958215008412e94600023de2250bf90108a0f52ccb9823ce2a6d23d0fe2bd3ed95e83a78501c94af433f399f82d08916be44a09942d329932a9f8e1f855e47f53b681d24491fc279342de6fb8019b3ab75fa2fa020afc20997c7eff2fd5d016e744a3be6c9e91bb910a64717782df9ad8861fc28a0c8fee60cd9fe620e7d0536a3ce24d1ff90d0f0e6a5d6319511792d4e7226b81aa0ee6cfcc8a4ac97feb1f185a32e6c9eab3221cfc20ae92146cff6552d8d1b86d7a091215f8f2610221bf95b06dcd9f50a12248a05e112cbd3ed99e9a83b9474f175a07af7359cfec9598b39da96db89ad7b08636ee56e6186178faa2b9b98acc655c6a0b93ad4385ab173a6d4555908794df423759b491cd3156f23cb2689e13721fe55f90108a0ec323ad685edad9845919652d2e67e7dbfe9c573613ddd2399ac487db2252925a085b1ef92b3c479b72ec57d50a1a49b8b4887e145903c25d47996e5d5a8fc63a6a090ebeb215d6d4ee80c152111fa12db0bb616143f9f9702a7e15b57e876c6cc09a0b7a5f31f7ca81b563d40aa9d43ca3d8c868e0202a04ef5ee7869e13359424ecfa04adea5151e5728f42e6882505722aa328d610129ec28666188454164f015ce74a06896bb83198b58a7967d5498e9c035e174e6c63044f733c3eecbebc00e89f3d6a062cd5d64db7b4acdc4590c32cdd7ed42f9be089dc0fbc9f7b2207a8e0226f166a0018ed337bad368826cc08b68495a82d3a6acd3370aaa53f1238aaa4a57fce6a3a06f52f07b44df53e1582f0216e1da0bb37dd9bed7898529dadaa41bdf58d9000ba0c1f9962fa48d693ec3b176cfe68636cdcd392875089e84f980767bb62681fe03a06b046f8fb64a518215e85cfe5d8df47950817429edf15dc1c11753196909eb06e3e2c0a00000000000000000000000000000000000000000000000000000000000000000e1a06a099c2521f2d988aa331903254cc735303a05eea9e432b925122de6c9b2c290f844f842a09c49c108d6cc44f003db042598486af6a1f2e85141eddddf6066b87a61a32506a010c5b88ba969d0a1d7efc721337d7db4999079ca1d9902591dd1735c6b88fc07"
-	utxoTx := genUTXOTransaction(utxoTransfer)
-
-	txs = append(txs, utxoTx)
-
-	block := &types.Block{
-		Header: &types.Header{
-			Height:     height,
-			Coinbase:   coinbase,
-			Time:       uint64(time.Now().Unix()),
-			NumTxs:     uint64(len(txs)),
-			TotalTxs:   uint64(len(txs)),
-			ParentHash: common.EmptyHash,
-			GasLimit:   1e19,
-		},
-		Data: &types.Data{
-			Txs: txs,
-		},
-	}
-	return block
-}
-
-func genBlockAccountToContract(height uint64, statedb *state.StateDB) *types.Block {
-	fmt.Println("account[0].address", accounts[0].Address.String())
-
-	txs := make(types.Txs, 0)
-	nonce := uint64(0)
-	demoTokenBIN := "60806040526012600160006101000a81548160ff021916908360ff16021790555034801561002c57600080fd5b50e4801561003957600080fd5b50600160009054906101000a900460ff1660ff16600a0a61271002600081905550600054e07fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f60003030600054604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a16107eb806101436000396000f300608060405260043610610083576000357c0100000000000000000000000000000000000000000000000000000000900463ffffffff16806306fdde0314610085578063313ce567146101225780633eaaf86b146101605780635d0268e61461019857806370a08231146101b8578063a4556fce1461021c578063d0ca623414610226575b005b34801561009157600080fd5b50e4801561009e57600080fd5b506100a7610230565b6040518080602001828103825283818151815260200191508051906020019080838360005b838110156100e75780820151818401526020810190506100cc565b50505050905090810190601f1680156101145780820380516001836020036101000a031916815260200191505b509250505060405180910390f35b34801561012e57600080fd5b50e4801561013b57600080fd5b5061014461026d565b604051808260ff1660ff16815260200191505060405180910390f35b34801561016c57600080fd5b50e4801561017957600080fd5b50610182610280565b6040518082815260200191505060405180910390f35b6101b660048036038101908080359060200190929190505050610286565b005b3480156101c457600080fd5b50e480156101d157600080fd5b50610206600480360381019080803573ffffffffffffffffffffffffffffffffffffffff1690602001909291905050506103b0565b6040518082815260200191505060405180910390f35b6102246103e8565b005b61022e6105cf565b005b60606040805190810160405280600981526020017f44656d6f546f6b656e0000000000000000000000000000000000000000000000815250905090565b600160009054906101000a900460ff1681565b60005481565b3073ffffffffffffffffffffffffffffffffffffffff16e273ffffffffffffffffffffffffffffffffffffffff161415156102c057600080fd5b80e41480156102cf5750600081115b15156102da57600080fd5b7fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f3330e2e4604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a150565b60008173ffffffffffffffffffffffffffffffffffffffff163073ffffffffffffffffffffffffffffffffffffffff16e19050919050565b6000e41115156103f757600080fd5b3373ffffffffffffffffffffffffffffffffffffffff163073ffffffffffffffffffffffffffffffffffffffff16e4e37fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f3330e2e4604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a17fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f303330e4604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a1565b600080341115156105df57600080fd5b6002340290503373ffffffffffffffffffffffffffffffffffffffff163073ffffffffffffffffffffffffffffffffffffffff1682e37fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f3330600034604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a17fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f30333084604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a1505600a165627a7a7230582035535fe5dabdc379daafa902bd1a8b41026cc07fe489cad1a962214b964671dd0029"
-	contractCreateTx := genContractCreateTx(accounts[0].Address, gasLimit, nonce, demoTokenBIN)
-	nonce++
-	txs = append(txs, contractCreateTx)
-
-	serTxAccountToUTXO := "f9013df856cf4852c16c3232f84d01890572c43566d008b800a00000000000000000000000000000000000000000000000000000000000000000a04a46c58b9c5dd33e27a81a6ef3d9ffe74121c2f2afe402cd305d7dab5bc5ed2ff84ec77cca059e4aa7f8459437c9b94a0f4816ff9e209ff9fe56e2a094deefd789056bc75e2d6310000084d0ca6234a04b1651c5abb75479ab0719edc3a221be8607e32ebf1b3f45a0b4db3348ca625f940000000000000000000000000000000000000000a09072581a50602b5b0a067358f9b9a419143eb7efa5565e19bc84c550a7bdcbf8c08806fcd7396cf8b80080f84582e3e5a099fc99e071d7eccbbcbfbf27981fa1d3dacb7c86935ba889ca114502b7ef83b9a074b07e15087e901065de877844ec9495981ce40d3dc4314584bf0ce7c5b563b6ccc580c0c0c080c5c0c0c0c0c0"
-	utxoTx := genUTXOTransaction(serTxAccountToUTXO)
-	nonce++
-	//var app *LinkApplication
-	app, err := initApp()
-	if err != nil {
-		log.Error("initApp", "err", err)
-		return nil
-	}
-	if err := utxoTx.CheckBasic(app); err != nil {
-		log.Error("CheckBasic", "err", err)
-	}
-	txs = append(txs, utxoTx)
-
-	fromaddr, _ := contractCreateTx.From()
-	contractAddr := crypto.CreateAddress(fromaddr, contractCreateTx.Nonce(), contractCreateTx.Data())
-	log.Debug("", "contractAddr", contractAddr.String())
-	demoTokenABI := `[{"constant":true,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"payable":false,"stateMutability":"pure","type":"function"},{"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":true,"inputs":[],"name":"_totalSupply","outputs":[{"name":"","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[{"name":"value","type":"uint256"}],"name":"addOrder","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"constant":true,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[],"name":"exchangebytoken","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"constant":false,"inputs":[],"name":"exchangebylk","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"inputs":[],"payable":false,"stateMutability":"nonpayable","type":"constructor"},{"payable":true,"stateMutability":"payable","type":"fallback"},{"anonymous":false,"inputs":[{"indexed":false,"name":"from","type":"address"},{"indexed":false,"name":"to","type":"address"},{"indexed":false,"name":"token","type":"address"},{"indexed":false,"name":"value","type":"uint256"}],"name":"Transfer","type":"event"}]`
-
-	//var cabi abi.ABI
-	cabi, err := abi.JSON(bytes.NewReader([]byte(demoTokenABI)))
-	if err != nil {
-		panic(err)
-	}
-
-	method := "balanceOf"
-	var data []byte
-	data, err = cabi.Pack(method, common.HexToAddress("0x54fb1c7d0f011dd63b08f85ed7b518ab82028100")) ////sha3("name()")
-	log.Debug("", "method data", fmt.Sprintf("0x%x", data))
-	if err != nil {
-		panic(err)
-	}
-
-	method = "exchangebylk"
-	data, err = cabi.Pack(method) ////sha3("name()")
-	log.Debug("", "method data", fmt.Sprintf("0x%x", data))
-
-	if err != nil {
-		panic(err)
-	}
-	//var contractCallTx *types.Transaction
-	_, err = genTx(accounts[0], nonce, &contractAddr, big.NewInt(0), data)
-	if err != nil {
-		fmt.Println("gentx err", err)
-	}
-	//txs = append(txs, contractCallTx)
-
-	block := &types.Block{
-		Header: &types.Header{
-			Height:     height,
-			Coinbase:   coinbase,
-			Time:       uint64(time.Now().Unix()),
-			NumTxs:     uint64(len(txs)),
-			TotalTxs:   uint64(len(txs)),
-			ParentHash: common.EmptyHash,
-			GasLimit:   1e19,
-		},
-		Data: &types.Data{
-			Txs: txs,
-		},
-	}
-
-	return block
-}
-
-func genBlockWithContractCreate(height uint64, statedb *state.StateDB) *types.Block {
-	txs := make(types.Txs, 0)
-	gasLimit := uint64(0)
-	nonce := statedb.GetNonce(accounts[0].Address)
-
-	ctx := genContractCreateTx(accounts[0].Address, 1000000, nonce, "../test/token/sol/SimpleToken.bin")
-	ctx.Amount = new(big.Int).SetUint64(1)
-	txs = append(txs, ctx)
-	txs = append(txs, genContractCreateTx(accounts[0].Address, gasLimit, nonce+1, "../test/token/sol/SimpleToken.bin"))
-
-	wasmCTX := genContractCreateTx(accounts[0].Address, gasLimit, nonce+2, "../test/token/tcvm/TestToken.bin")
-	txs = append(txs, wasmCTX)
-
-	contractAddr := crypto.CreateAddress(wasmCTX.FromAddr, wasmCTX.Nonce(), wasmCTX.Data())
-	cut := genContractUpgradeTx(wasmCTX.FromAddr, contractAddr, wasmCTX.Nonce()+1, "../test/token/tcvm/TestToken.bin")
-	txs = append(txs, cut)
-
-	block := &types.Block{
-		Header: &types.Header{
-			Height:     height,
-			Coinbase:   coinbase,
-			Time:       uint64(time.Now().Unix()),
-			NumTxs:     uint64(len(txs)),
-			TotalTxs:   uint64(len(txs)),
-			ParentHash: common.EmptyHash,
-			GasLimit:   1e19,
-		},
-		Data: &types.Data{
-			Txs: txs,
-		},
-	}
-
-	return block
-}
-
-func genBlockWithTransactionContract(height uint64, statedb *state.StateDB) *types.Block {
-	txs := make(types.Txs, 0)
-	//gasLimit := uint64(0)
-	nonce := statedb.GetNonce(accounts[0].Address)
-	txs = append(txs, genTxForCreateContract(accounts[0], 10000000, nonce, "../test/token/sol/SimpleToken.bin"))
-	txs = append(txs, genTxForCreateContract(accounts[0], 10000000, nonce+1, "../test/token/sol/SimpleToken.bin"))
-	block := &types.Block{
-		Header: &types.Header{
-			Height:     height,
-			Coinbase:   coinbase,
-			Time:       uint64(time.Now().Unix()),
-			NumTxs:     uint64(len(txs)),
-			TotalTxs:   uint64(len(txs)),
-			ParentHash: common.EmptyHash,
-			GasLimit:   1e19,
-		},
-		Data: &types.Data{
-			Txs: txs,
-		},
-	}
-
-	return block
-}
-
-func genBlockWithLocalTransaction(height uint64) *types.Block {
-	var maxTxNum = 1
-	txs := make(types.Txs, 0)
-
-	var nonce = uint64(0)
-
-	for i := 0; i < maxTxNum; i++ {
-		//tokenAddress := &common.Address{0}
-		to := testToAddr
-		amount := big.NewInt(1e18)
-		gasLimit = types.CalNewAmountGas(amount, types.EverLiankeFee)
-		signedTx, err := genTx(accounts[0], nonce, &to, amount, nil)
+	LEN := 4
+	Accs = make([]*keystore.Key, LEN)
+	UtxoAccs = make([]*utxoKey, LEN)
+	for i := 0; i < LEN; i++ {
+		// gen acc
+		s := string(crypto.Keccak512([]byte(string(i))))
+		ask, err := ecdsa.GenerateKey(crypto.S256(), strings.NewReader(s))
 		if err != nil {
 			panic(err)
 		}
-		txs = append(txs, signedTx)
-		nonce++
+		aaddr := crypto.PubkeyToAddress(ask.PublicKey)
+		Accs[i] = &keystore.Key{
+			PrivateKey: ask,
+			Address:    aaddr,
+		}
+		// gen utxo
+		sksr := ringct.ScalarmultH(ringct.H)
+		for j := 0; j < i; j++ {
+			sksr = ringct.ScalarmultH(sksr)
+		}
+		pksr := ringct.ScalarmultBase(sksr)
+		//sksr, pksr := xcrypto.SkpkGen()
+		skvr, pkvr := sksr, pksr
+		sks, pks, skv, pkv := lktypes.SecretKey(sksr), lktypes.PublicKey(pksr), lktypes.SecretKey(skvr), lktypes.PublicKey(pkvr)
+		addr := lktypes.AccountAddress{
+			ViewPublicKey:  pkv,
+			SpendPublicKey: pks,
+		}
+		acc := lktypes.AccountKey{
+			Addr:      addr,
+			SpendSKey: sks,
+			ViewSKey:  skv,
+			SubIdx:    uint64(0),
+		}
+		address := wallet.AddressToStr(&acc, uint64(0))
+		acc.Address = address
+		keyi := make(map[lktypes.PublicKey]uint64)
+		keyi[acc.Addr.SpendPublicKey] = 0
+		UtxoAccs[i] = &utxoKey{
+			Sks:  sks,
+			Skv:  skv,
+			Pks:  pks,
+			Pkv:  pkv,
+			Addr: addr,
+			Acc:  acc,
+			Keyi: keyi,
+		}
 	}
+	log.Debug("00", "a0", Accs[0].PrivateKey, "a1", Accs[1].PrivateKey, "u0", UtxoAccs[0].Sks, "u1", UtxoAccs[0].Sks)
+}
 
+func balancesChecker(t *testing.T, beforeBalanceIn, afterBalanceIn, beforeBalanceOut, afterBalanceOut []*big.Int, expectAmount, expectFee, actualFee *big.Int) {
+	fmt.Println(beforeBalanceIn, afterBalanceIn, beforeBalanceOut, afterBalanceOut, expectAmount, expectFee, actualFee)
+	// Sanity Check
+	ins := len(beforeBalanceIn)
+	for _, list := range [][]*big.Int{beforeBalanceIn, afterBalanceIn} {
+		assert.Equal(t, ins, len(list))
+	}
+	outs := len(beforeBalanceOut)
+	for _, list := range [][]*big.Int{beforeBalanceOut, afterBalanceOut} {
+		assert.Equal(t, outs, len(list))
+	}
+	// Legality Check
+	amountlist := make([]*big.Int, 0)
+	for _, list := range [][]*big.Int{beforeBalanceIn, afterBalanceIn, beforeBalanceOut, afterBalanceOut} {
+		amountlist = append(amountlist, list...)
+	}
+	for _, item := range []*big.Int{expectAmount, expectFee, actualFee} {
+		amountlist = append(amountlist, item)
+	}
+	for _, amount := range amountlist {
+		assert.True(t, amount.Sign() >= 0)
+	}
+	// Equality Check
+	//delta(input) = fee + amount
+	sumin := big.NewInt(0)
+	for i := 0; i < ins; i++ {
+		d := big.NewInt(0).Sub(beforeBalanceIn[i], afterBalanceIn[i])
+		sumin = big.NewInt(0).Add(sumin, d)
+	}
+	assert.Equal(t, big.NewInt(0).Add(expectAmount, expectFee), sumin)
+	//delta(output) = amount
+	sumout := big.NewInt(0)
+	for i := 0; i < outs; i++ {
+		d := big.NewInt(0).Sub(afterBalanceOut[i], beforeBalanceOut[i])
+		sumout = big.NewInt(0).Add(sumout, d)
+	}
+	assert.Equal(t, expectAmount, sumout)
+	//fee=fee
+	assert.Equal(t, expectFee, actualFee)
+}
+
+func resultChecker(t *testing.T, receipts types.Receipts, utxoOutputs []*types.UTXOOutputData, keyImages []*lktypes.Key, expReceiptsLen, expUtxoOutputsLen, expKeyImageLen int) {
+	// Sanity Check
+	assert.True(t, expReceiptsLen >= 0)
+	assert.True(t, expUtxoOutputsLen >= 0)
+	assert.True(t, expKeyImageLen >= 0)
+	// Length Check
+	assert.Equal(t, expReceiptsLen, len(receipts))
+	assert.Equal(t, expUtxoOutputsLen, len(utxoOutputs))
+	assert.Equal(t, expKeyImageLen, len(keyImages))
+}
+
+func othersChecker(t *testing.T, expnonce []uint64, nonce []uint64) {
+	// Sanity Check
+	assert.True(t, len(nonce) > 0)
+	assert.Equal(t, len(nonce), len(expnonce))
+	// Length Check
+	for ind, n := range nonce {
+		expn := expnonce[ind]
+		assert.True(t, n >= 0)
+		assert.Equal(t, expn, n)
+	}
+}
+
+func hashChecker(t *testing.T, receiptHash, stateHash, balanceRecordHash common.Hash, exprecipts, expstate, expbalancerecord string) {
+
+	assert.Equal(t, receiptHash, common.HexToHash(exprecipts))
+	assert.Equal(t, stateHash, common.HexToHash(expstate))
+	assert.Equal(t, balanceRecordHash, common.HexToHash(expbalancerecord))
+}
+
+func genBlock(txs types.Txs) *types.Block {
 	block := &types.Block{
 		Header: &types.Header{
-			Height:     height,
-			Coinbase:   coinbase,
+			Height:     1,
+			Coinbase:   common.HexToAddress("0x0000000000000000000000000000000000000000"),
 			Time:       uint64(time.Now().Unix()),
 			NumTxs:     uint64(len(txs)),
 			TotalTxs:   uint64(len(txs)),
@@ -527,114 +203,1611 @@ func genBlockWithLocalTransaction(height uint64) *types.Block {
 			Txs: txs,
 		},
 	}
-
 	return block
 }
 
-func getUTXOTokenTx(skey *ecdsa.PrivateKey, toAddr common.Address, tokenID common.Address, nonce uint64, amount *big.Int, data []byte) *types.UTXOTransaction {
-	addr := crypto.PubkeyToAddress(skey.PublicKey)
-	accountSource := &types.AccountSourceEntry{
-		From:   addr,
-		Nonce:  nonce,
-		Amount: amount,
+func getBalance(tx *types.UTXOTransaction, skv, sks lktypes.SecretKey) (amount *big.Int, mask lktypes.Key) {
+	amount = big.NewInt(-1) // if no input matched, return -1
+	//gen acc & kI
+	acc := lktypes.AccountKey{
+		Addr: lktypes.AccountAddress{
+			SpendPublicKey: lktypes.PublicKey(ringct.ScalarmultBase(lktypes.Key(sks))),
+			ViewPublicKey:  lktypes.PublicKey(ringct.ScalarmultBase(lktypes.Key(skv))),
+		},
+		SpendSKey: sks,
+		ViewSKey:  skv,
+		SubIdx:    uint64(0),
 	}
-	transferGas := types.CalNewAmountGas(amount, types.EverLiankeFee) + 100000
-	transferFee := big.NewInt(0).Mul(big.NewInt(types.ParGasPrice), big.NewInt(0).SetUint64(transferGas))
-	accountDest := &types.AccountDestEntry{
-		To:     toAddr,
-		Amount: big.NewInt(0).Sub(amount, transferFee),
+	address := wallet.AddressToStr(&acc, uint64(0))
+	acc.Address = address
+	keyi := make(map[lktypes.PublicKey]uint64)
+	keyi[acc.Addr.SpendPublicKey] = 0
+	// output
+	outputID := -1
+	outputCnt := len(tx.Outputs)
+	for i := 0; i < outputCnt; i++ {
+		o := tx.Outputs[i]
+		switch ro := o.(type) {
+		case *types.UTXOOutput:
+			outputID++
+			keyMaps := make(map[lktypes.KeyDerivation]lktypes.PublicKey, 0)
+			derivationKeys := make([]lktypes.KeyDerivation, 0)
+			derivationKey, err := xcrypto.GenerateKeyDerivation(tx.RKey, skv)
+			if err != nil {
+				log.Error("GenerateKeyDerivation fail", "rkey", tx.RKey, "err", err)
+				continue
+			}
+			derivationKeys = append(derivationKeys, derivationKey)
+			keyMaps[derivationKey] = tx.RKey
+			if len(tx.AddKeys) > 0 {
+				//we use a addinational key for utxo->account proof, maybe cause err here
+				for _, addkey := range tx.AddKeys {
+					derivationKey, err = xcrypto.GenerateKeyDerivation(addkey, skv)
+					if err != nil {
+						log.Info("GenerateKeyDerivation fail", "addkey", addkey, "err", err)
+						continue
+					}
+					derivationKeys = append(derivationKeys, derivationKey)
+					keyMaps[derivationKey] = addkey
+				}
+			}
+			recIdx := uint64(outputID)
+			realDeriKey, _, err := types.IsOutputBelongToAccount(&acc, keyi, ro.OTAddr, derivationKeys, recIdx)
+			if err != nil {
+				// trivial error for multi output tx
+				//log.Info("IsOutputBelongToAccount fail", "ro.OTAddr", ro.OTAddr, "derivationKey", derivationKey, "recIdx", recIdx, "err", err)
+				continue
+			}
+			ecdh := &lktypes.EcdhTuple{
+				Mask:   tx.RCTSig.RctSigBase.EcdhInfo[outputID].Mask,
+				Amount: tx.RCTSig.RctSigBase.EcdhInfo[outputID].Amount,
+			}
+			log.Debug("GenerateKeyDerivation", "derivationKey", realDeriKey, "amount", tx.RCTSig.RctSigBase.EcdhInfo[outputID].Amount)
+			scalar, err := xcrypto.DerivationToScalar(realDeriKey, outputID)
+			if err != nil {
+				log.Error("DerivationToScalar fail", "derivationKey", realDeriKey, "outputID", outputID, "err", err)
+				continue
+			}
+			ok := xcrypto.EcdhDecode(ecdh, lktypes.Key(scalar), false)
+			if !ok {
+				log.Error("EcdhDecode fail", "err", err)
+				continue
+			}
+			amount = big.NewInt(0).Mul(types.Hash2BigInt(ecdh.Amount), big.NewInt(types.UTXO_COMMITMENT_CHANGE_RATE))
+			mask = ecdh.Mask
+		default:
+		}
+	}
+	return
+}
+
+func calExpectAmount(amounts ...*big.Int) *big.Int {
+	sum := big.NewInt(0)
+	for _, amount := range amounts {
+		sum.Add(sum, amount)
+	}
+	return sum
+}
+
+func calExpectFee(fees ...uint64) *big.Int {
+	sum := big.NewInt(0)
+	for _, fee := range fees {
+		feeI := big.NewInt(0).SetUint64(fee)
+		sum.Add(sum, feeI)
+	}
+	sum.Mul(sum, big.NewInt(types.ParGasPrice))
+	return sum
+}
+
+//*********** Account Based Transactions Test **********
+//tx
+func TestAccount2Account(t *testing.T) {
+	state := State.Copy()
+	types.SaveBalanceRecord = true
+	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+
+	sender := Bank[0].PrivateKey
+	sAdd := Bank[0].Address
+	rAdd := Accs[0].Address
+
+	amount1 := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(100))
+	fee1 := types.CalNewAmountGas(amount1, types.EverLiankeFee)
+	nonce := uint64(0)
+	tx1 := types.NewTransaction(nonce, rAdd, amount1, fee1, gasPrice, nil)
+	tx1.Sign(types.GlobalSTDSigner, sender)
+	nonce++
+
+	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	bfBalanceOut := []*big.Int{state.GetBalance(rAdd)}
+	block := genBlock(types.Txs{tx1})
+	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+	if err != nil {
+		panic(err)
+	}
+	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	afBalanceOut := []*big.Int{state.GetBalance(rAdd)}
+
+	expectAmount := calExpectAmount(amount1)
+	expectFee := calExpectFee(fee1)
+	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+	expectNonce := []uint64{1}
+	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee)
+	resultChecker(t, receipts, utxoOutputs, keyImages, 1, 0, 0)
+	othersChecker(t, expectNonce, actualNonce)
+
+	receiptHash := receipts.Hash()
+	stateHash := state.IntermediateRoot(false)
+	balanceRecordHash := types.RlpHash(types.BlockBalanceRecordsInstance.Json())
+	log.Debug("SAVER", "rh", receiptHash.Hex(), "sh", stateHash.Hex(), "brh", balanceRecordHash.Hex())
+	hashChecker(t, receiptHash, stateHash, balanceRecordHash, "0x9199391959b690a1684c077b1ddddaf4d3a1393bc14ffcc49981c1a943982c97", "0xc9def4039b552cfe968214bdcdfaa0ca19d5710c5c816e4aa849752336b90963", "0x56cef0615cc7e8f6a90ec993ec41fb7e09b29401423ce3130f77f41c5a06ec39")
+}
+
+//tx2(to Contract)
+func TestAccount2Contract(t *testing.T) {
+	state := State.Copy()
+
+	types.SaveBalanceRecord = true
+	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+
+	sender := Bank[0].PrivateKey
+	sAdd := Bank[0].Address
+
+	amount1 := big.NewInt(0)
+	fee1 := uint64(0)
+	nonce := uint64(0)
+	tx1 := genContractCreateTx(sAdd, 1000000, nonce, "../test/token/sol/SimpleToken.bin")
+	tx1.Sign(types.GlobalSTDSigner, sender)
+	tkAdd := crypto.CreateAddress(tx1.FromAddr, tx1.Nonce(), tx1.Data())
+	nonce++
+
+	bin, err := ioutil.ReadFile("../test/token/sol/SimpleToken.abi")
+	if err != nil {
+		panic(err)
+	}
+	cabi, err := abi.JSON(bytes.NewReader(bin))
+	if err != nil {
+		panic(err)
+	}
+	var data []byte
+	method := "transfertokentest"
+	data, err = cabi.Pack(method, big.NewInt(0))
+	if err != nil {
+		panic(err)
+	}
+
+	amount2 := big.NewInt(0)
+	fee2 := uint64(31539)
+	tx2 := types.NewTransaction(nonce, tkAdd, big.NewInt(0), fee2, gasPrice, data)
+	tx2.Sign(types.GlobalSTDSigner, sender)
+	nonce++
+
+	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	bfBalanceOut := []*big.Int{big.NewInt(0)}
+	block := genBlock(types.Txs{tx1, tx2})
+	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+	if err != nil {
+		panic(err)
+	}
+	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	afBalanceOut := []*big.Int{big.NewInt(0)}
+
+	expectAmount := calExpectAmount(amount1, amount2)
+	expectFee := calExpectFee(fee1, fee2)
+	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+	expectNonce := []uint64{nonce}
+	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee)
+	resultChecker(t, receipts, utxoOutputs, keyImages, 2, 0, 0)
+	othersChecker(t, expectNonce, actualNonce)
+
+	receiptHash := receipts.Hash()
+	stateHash := state.IntermediateRoot(false)
+	balanceRecordHash := types.RlpHash(types.BlockBalanceRecordsInstance.Json())
+	log.Debug("SAVER", "rh", receiptHash.Hex(), "sh", stateHash.Hex(), "brh", balanceRecordHash.Hex())
+	hashChecker(t, receiptHash, stateHash, balanceRecordHash, "0xbc0e06d5460784e4e8828db5de4b686fa108308b475de024bc911513a3db2a16", "0xa07f4b8f34bc8fec02e7daedb5944c135192d90eb068ecd3b001ffeea6ce80e0", "0x8dcdf5c769987bb4ea14d4aa38f73e903806bd2dc24fea38cf6160beaacaacf2")
+}
+
+//tx3(to Contract & Value transfer)
+func TestAccount2Contract2(t *testing.T) {
+	state := State.Copy()
+	types.SaveBalanceRecord = true
+	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+
+	sender := Bank[0].PrivateKey
+	sAdd := Bank[0].Address
+
+	amount1 := big.NewInt(0)
+	fee1 := uint64(0)
+	nonce := uint64(0)
+	tx1 := genContractCreateTx(sAdd, 1000000, nonce, "../test/token/sol/t.bin")
+	tx1.Sign(types.GlobalSTDSigner, sender)
+	tkAdd := crypto.CreateAddress(tx1.FromAddr, tx1.Nonce(), tx1.Data())
+	nonce++
+
+	bin, err := ioutil.ReadFile("../test/token/sol/t.abi")
+	if err != nil {
+		panic(err)
+	}
+	cabi, err := abi.JSON(bytes.NewReader(bin))
+	if err != nil {
+		panic(err)
+	}
+	var data []byte
+	method := "set"
+	data, err = cabi.Pack(method, big.NewInt(0))
+	if err != nil {
+		panic(err)
+	}
+
+	amount2 := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(100))
+	fee2 := types.CalNewAmountGas(amount2, types.EverContractLiankeFee) + uint64(26596)
+	tx2 := types.NewTransaction(nonce, tkAdd, amount2, fee2, gasPrice, data)
+	tx2.Sign(types.GlobalSTDSigner, sender)
+	nonce++
+
+	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	bfBalanceOut := []*big.Int{big.NewInt(0)}
+	block := genBlock(types.Txs{tx1, tx2})
+	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+	if err != nil {
+		panic(err)
+	}
+	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	afBalanceOut := []*big.Int{state.GetBalance(tkAdd)}
+
+	expectAmount := calExpectAmount(amount1, amount2)
+	expectFee := calExpectFee(fee1, fee2)
+	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+	expectNonce := []uint64{nonce}
+	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee)
+	resultChecker(t, receipts, utxoOutputs, keyImages, 2, 0, 0)
+	othersChecker(t, expectNonce, actualNonce)
+
+	receiptHash := receipts.Hash()
+	stateHash := state.IntermediateRoot(false)
+	balanceRecordHash := types.RlpHash(types.BlockBalanceRecordsInstance.Json())
+	log.Debug("SAVER", "rh", receiptHash.Hex(), "sh", stateHash.Hex(), "brh", balanceRecordHash.Hex())
+	hashChecker(t, receiptHash, stateHash, balanceRecordHash, "0x97981d7553106178d0555f4117f2a9d26627629212de3fd7ea755de66c0391c7", "0x1c77efe459c11215af1f99822cf336b9b789c50281ff1585c90f602d2ecc1af8", "0x276aac6012a392499a40d81f66959f9bd009ff607b56b16501ca73295c9968c6")
+}
+
+//tx4(to Contract & Value transfer but fail)
+func TestAccount2ContractVmerr(t *testing.T) {
+	state := State.Copy()
+	types.SaveBalanceRecord = true
+	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+
+	sender := Bank[0].PrivateKey
+	sAdd := Bank[0].Address
+
+	amount1 := big.NewInt(0)
+	fee1 := uint64(0)
+	nonce := uint64(0)
+	tx1 := genContractCreateTx(sAdd, 1000000, nonce, "../test/token/sol/t.bin")
+	tx1.Sign(types.GlobalSTDSigner, sender)
+	tkAdd := crypto.CreateAddress(tx1.FromAddr, tx1.Nonce(), tx1.Data())
+	nonce++
+
+	bin, err := ioutil.ReadFile("../test/token/sol/t.abi")
+	if err != nil {
+		panic(err)
+	}
+	cabi, err := abi.JSON(bytes.NewReader(bin))
+	if err != nil {
+		panic(err)
+	}
+	var data []byte
+	method := "set"
+	data, err = cabi.Pack(method, big.NewInt(0))
+	if err != nil {
+		panic(err)
+	}
+
+	amount2 := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(100))
+	fee2bf := types.CalNewAmountGas(amount2, types.EverContractLiankeFee) + uint64(26595)
+	fee2 := uint64(26595)
+	tx2 := types.NewTransaction(nonce, tkAdd, amount2, fee2bf, gasPrice, data)
+	tx2.Sign(types.GlobalSTDSigner, sender)
+	nonce++
+
+	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	bfBalanceOut := []*big.Int{big.NewInt(0)}
+	block := genBlock(types.Txs{tx1, tx2})
+	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+	if err != nil {
+		panic(err)
+	}
+	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	afBalanceOut := []*big.Int{state.GetBalance(tkAdd)}
+
+	expectAmount := calExpectAmount(amount1)
+	expectFee := calExpectFee(fee1, fee2)
+	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+	expectNonce := []uint64{nonce}
+	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee)
+	resultChecker(t, receipts, utxoOutputs, keyImages, 2, 0, 0)
+	othersChecker(t, expectNonce, actualNonce)
+
+	receiptHash := receipts.Hash()
+	stateHash := state.IntermediateRoot(false)
+	balanceRecordHash := types.RlpHash(types.BlockBalanceRecordsInstance.Json())
+	log.Debug("SAVER", "rh", receiptHash.Hex(), "sh", stateHash.Hex(), "brh", balanceRecordHash.Hex())
+	hashChecker(t, receiptHash, stateHash, balanceRecordHash, "0x2728f90aafc6c17d468a31ad23b234f593af353e29240a3ebd562d44524b046f", "0x09caa0d1920d500cae85e41e0b64da7e9f592fa0918f52f9793a950e3e2b472b", "0x920d153684014a1b61af6c6a29fcb29a28739e53c7589ce20411b96141e9e0ee")
+}
+
+//txt
+func TestAccount2AccountToken(t *testing.T) {
+	state := State.Copy()
+	types.SaveBalanceRecord = true
+	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+
+	sender := Bank[0].PrivateKey
+	sAdd := Bank[0].Address
+	rAdd := Accs[0].Address
+
+	amount1 := big.NewInt(0)
+	fee1 := uint64(0)
+	nonce := uint64(0)
+	tx1 := genContractCreateTx(sAdd, 1000000, nonce, "../test/token/sol/SimpleToken.bin")
+	tx1.Sign(types.GlobalSTDSigner, sender)
+	nonce++
+	tkAdd := crypto.CreateAddress(tx1.FromAddr, tx1.Nonce(), tx1.Data())
+
+	amount2 := big.NewInt(0)
+	fee2 := types.CalNewAmountGas(amount2, types.EverLiankeFee)
+	tkamount := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(100))
+	tx2 := types.NewTokenTransaction(tkAdd, 1, rAdd, tkamount, fee2, gasPrice, nil)
+	tx2.Sign(types.GlobalSTDSigner, sender)
+	nonce++
+
+	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	bfBalanceOut := []*big.Int{state.GetBalance(rAdd)}
+	bftkBalanceIn := []*big.Int{state.GetTokenBalance(sAdd, tkAdd)}
+	bftkBalanceOut := []*big.Int{state.GetTokenBalance(rAdd, tkAdd)}
+	block := genBlock(types.Txs{tx1, tx2})
+	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+	if err != nil {
+		panic(err)
+	}
+	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	afBalanceOut := []*big.Int{state.GetBalance(rAdd)}
+	aftkBalanceIn := []*big.Int{state.GetTokenBalance(sAdd, tkAdd)}
+	aftkBalanceOut := []*big.Int{state.GetTokenBalance(rAdd, tkAdd)}
+
+	expectAmount := calExpectAmount(amount1, amount2)
+	expecttkAmount := calExpectAmount(tkamount)
+	expectFee := calExpectFee(fee1, fee2)
+	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+	expectNonce := []uint64{nonce}
+	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee)
+	balancesChecker(t, bftkBalanceIn, aftkBalanceIn, bftkBalanceOut, aftkBalanceOut, expecttkAmount, big.NewInt(0), big.NewInt(0))
+	resultChecker(t, receipts, utxoOutputs, keyImages, 2, 0, 0)
+	othersChecker(t, expectNonce, actualNonce)
+
+	receiptHash := receipts.Hash()
+	stateHash := state.IntermediateRoot(false)
+	balanceRecordHash := types.RlpHash(types.BlockBalanceRecordsInstance.Json())
+	log.Debug("SAVER", "rh", receiptHash.Hex(), "sh", stateHash.Hex(), "brh", balanceRecordHash.Hex())
+	hashChecker(t, receiptHash, stateHash, balanceRecordHash, "0xdb1e7456de2767029930cf70815f4aedd593cf7dbb5ee1d9e9d5eb7207605551", "0x56ef2209dd32ce00d23afdab5f731ea942fd5f6f1399ddc20fb5053defa7d0bd", "0xfcea8b6bbec0175da26f99c825e3f833532fb54f64e3053dc4bda5c68e279a3a")
+}
+
+//cct
+func TestContractCreation(t *testing.T) {
+	state := State.Copy()
+	types.SaveBalanceRecord = true
+	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+
+	sender := Bank[0].PrivateKey
+	sAdd := Bank[0].Address
+	nonce := uint64(0)
+	amount1 := big.NewInt(0)
+	fee1 := uint64(0)
+	tx := genContractCreateTx(accounts[0].Address, 1000000, nonce, "../test/token/sol/SimpleToken.bin")
+	tx.Sign(types.GlobalSTDSigner, sender)
+	nonce++
+
+	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	bfBalanceOut := []*big.Int{}
+	block := genBlock(types.Txs{tx})
+	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+	if err != nil {
+		panic(err)
+	}
+	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	afBalanceOut := []*big.Int{}
+
+	expectAmount := calExpectAmount(amount1)
+	expectFee := calExpectFee(fee1)
+	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+	expectNonce := []uint64{nonce}
+	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee)
+	resultChecker(t, receipts, utxoOutputs, keyImages, 1, 0, 0)
+	othersChecker(t, expectNonce, actualNonce)
+
+	receiptHash := receipts.Hash()
+	stateHash := state.IntermediateRoot(false)
+	balanceRecordHash := types.RlpHash(types.BlockBalanceRecordsInstance.Json())
+	log.Debug("SAVER", "rh", receiptHash.Hex(), "sh", stateHash.Hex(), "brh", balanceRecordHash.Hex())
+	hashChecker(t, receiptHash, stateHash, balanceRecordHash, "0x22f093fd155fd4b933f06ab869b982373b1baa080c0ef5305f690ea0b5c75deb", "0xbf4a82a0a7db313b6a9d1b7d958435cacab3e7cd7e9445368a6c79c945de81af", "0x119a145bf3a570a87f08dfae193f8bd6bee8b036d1aea1bd6e1154b6aba24a8d")
+}
+
+//cct2
+func TestContractCreation2(t *testing.T) {
+	state := State.Copy()
+	types.SaveBalanceRecord = true
+	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+
+	sender := Bank[0].PrivateKey
+	sAdd := Bank[0].Address
+	nonce := uint64(0)
+	amount1 := big.NewInt(0).Mul(big.NewInt(100), big.NewInt(1e16))
+	fee1 := uint64(0)
+	tx1 := genContractCreateTx2(accounts[0].Address, 100000, nonce, "../test/token/sol/a.bin", amount1)
+	tx1.Sign(types.GlobalSTDSigner, sender)
+	nonce++
+	tkAdd := crypto.CreateAddress(tx1.FromAddr, tx1.Nonce(), tx1.Data())
+	//log.Debug("tx", "tx", tx1)
+
+	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	bfBalanceOut := []*big.Int{big.NewInt(0)}
+	block := genBlock(types.Txs{tx1})
+	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+	if err != nil {
+		panic(err)
+	}
+	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	afBalanceOut := []*big.Int{state.GetBalance(tkAdd)}
+	log.Debug("add", "tkadd", tkAdd, "acadd", receipts[0].ContractAddress, "receipt", receipts[0])
+
+	expectAmount := calExpectAmount(amount1)
+	expectFee := calExpectFee(fee1)
+	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+	expectNonce := []uint64{nonce}
+	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee)
+	resultChecker(t, receipts, utxoOutputs, keyImages, 1, 0, 0)
+	othersChecker(t, expectNonce, actualNonce)
+
+	receiptHash := receipts.Hash()
+	stateHash := state.IntermediateRoot(false)
+	balanceRecordHash := types.RlpHash(types.BlockBalanceRecordsInstance.Json())
+	log.Debug("SAVER", "rh", receiptHash.Hex(), "sh", stateHash.Hex(), "brh", balanceRecordHash.Hex())
+	hashChecker(t, receiptHash, stateHash, balanceRecordHash, "0x33f317261865283696181f0b763639881016eba587c35f8695e2e7e2024a5fcf", "0xe1bdd90a9ef73d3b3838432bc39f44c1a90a56720561f0b8137265e8ee7c0d13", "0x4789c1287a39f8327e4d710fdff672807a3cc0c48a80da530dfab338267fc27c")
+}
+
+//cctbytx
+// func TestContractCreationBySendToEmptyAddress(t *testing.T) {
+// 		state := State.Copy()
+//types.SaveBalanceRecord = true
+//types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+
+// 	sender := Bank[0].PrivateKey
+// 	sAdd := Bank[0].Address
+
+// 	var ccode []byte
+// 	bin, err := ioutil.ReadFile("../test/token/sol/SimpleToken.bin")
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	ccode = common.Hex2Bytes(string(bin))
+
+// 	amount1 := big.NewInt(0)
+// 	fee1 := uint64(1494617)
+// 	nonce := uint64(0)
+// 	tx := types.NewContractCreation(nonce, amount1, fee1, gasPrice, ccode)
+// 	tx.Sign(types.GlobalSTDSigner, sender)
+// 	tkAdd := crypto.CreateAddress(sAdd, tx.Nonce(), tx.Data())
+// 	nonce++
+
+// 	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+// 	bfBalanceOut := []*big.Int{big.NewInt(0)}
+// 	block := genBlock(types.Txs{tx})
+// 	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+// 	afBalanceOut := []*big.Int{state.GetBalance(tkAdd)}
+
+// 	expectAmount := calExpectAmount(amount1)
+// 	expectFee := calExpectFee(fee1)
+// 	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+// 	expectNonce := []uint64{nonce}
+// 	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+// 	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee)
+// 	resultChecker(t, receipts, utxoOutputs, keyImages, 1, 0, 0)
+// 	othersChecker(t, expectNonce, actualNonce)
+// }
+
+//cut
+func TestContractUpdate(t *testing.T) {
+	state := State.Copy()
+	types.SaveBalanceRecord = true
+	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+
+	sender := Bank[0].PrivateKey
+	sAdd := Bank[0].Address
+
+	amount1 := big.NewInt(0)
+	fee1 := uint64(0)
+	nonce := uint64(0)
+	tx1 := genContractCreateTx(accounts[0].Address, 1000000, nonce, "../test/token/tcvm/TestToken.bin")
+	tx1.Sign(types.GlobalSTDSigner, sender)
+	contractAddr := crypto.CreateAddress(tx1.FromAddr, tx1.Nonce(), tx1.Data())
+	nonce++
+
+	amount2 := big.NewInt(0)
+	fee2 := uint64(0)
+	tx2 := genContractUpgradeTx(tx1.FromAddr, contractAddr, nonce, "../test/token/tcvm/TestToken.bin")
+	tx2.Sign(types.GlobalSTDSigner, sender)
+	nonce++
+
+	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	bfBalanceOut := []*big.Int{}
+	block := genBlock(types.Txs{tx1, tx2})
+	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+	if err != nil {
+		panic(err)
+	}
+	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	afBalanceOut := []*big.Int{}
+
+	expectAmount := calExpectAmount(amount1, amount2)
+	expectFee := calExpectFee(fee1, fee2)
+	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+	expectNonce := []uint64{nonce}
+	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee)
+	resultChecker(t, receipts, utxoOutputs, keyImages, 2, 0, 0)
+	othersChecker(t, expectNonce, actualNonce)
+
+	receiptHash := receipts.Hash()
+	stateHash := state.IntermediateRoot(false)
+	balanceRecordHash := types.RlpHash(types.BlockBalanceRecordsInstance.Json())
+	log.Debug("SAVER", "rh", receiptHash.Hex(), "sh", stateHash.Hex(), "brh", balanceRecordHash.Hex())
+	hashChecker(t, receiptHash, stateHash, balanceRecordHash, "0xe4c1699aa0c9bf8cc3aa1fe91eb8221789b24787168738ded0d2e432bbea9ec2", "0x8d95fc235a83b4b9d0427f2df600cfbd917d1bf9df99815884e4eb4117a74c68", "0x7773c71c5273f9e63153f88e46e5573a0cc57aac879a9078c7faa913901f4297")
+}
+
+//*********** UTXO Based Transactions Test **********
+
+//A->A
+func TestSingleAccount2SingleAccount(t *testing.T) {
+	state := State.Copy()
+	types.SaveBalanceRecord = true
+	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+
+	sender := Bank[0].PrivateKey
+	sAdd := Bank[0].Address
+	rAdd := Accs[0].Address
+
+	amount1bf := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(100))
+	fee1 := types.CalNewAmountGas(amount1bf, types.EverLiankeFee)
+	fee1i := big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee1), big.NewInt(types.ParGasPrice))
+	amount1 = big.NewInt(0).Sub(amount1bf, fee1i)
+	nonce := uint64(0)
+	ain := types.AccountSourceEntry{
+		From:   sAdd,
+		Nonce:  nonce,
+		Amount: amount1bf,
+	}
+	aout := types.AccountDestEntry{
+		To:     rAdd,
+		Amount: amount1,
+		Data:   nil,
+	}
+	tx, _, err := types.NewAinTransaction(&ain, []types.DestEntry{&aout}, common.EmptyAddress, nil)
+	if err != nil {
+		panic(err)
+	}
+	tx.Sign(types.GlobalSTDSigner, sender)
+	nonce++
+
+	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	bfBalanceOut := []*big.Int{state.GetBalance(rAdd)}
+	block := genBlock(types.Txs{tx})
+	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+	if err != nil {
+		panic(err)
+	}
+	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	afBalanceOut := []*big.Int{state.GetBalance(rAdd)}
+
+	expectAmount := calExpectAmount(amount1)
+	expectFee := calExpectFee(fee1)
+	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+	expectNonce := []uint64{nonce}
+	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee)
+	resultChecker(t, receipts, utxoOutputs, keyImages, 1, 0, 0)
+	othersChecker(t, expectNonce, actualNonce)
+
+	receiptHash := types.RlpHash("")
+	stateHash := state.IntermediateRoot(false)
+	balanceRecordHash := types.RlpHash("")
+	log.Debug("SAVER", "rh", receiptHash.Hex(), "sh", stateHash.Hex(), "brh", balanceRecordHash.Hex())
+	hashChecker(t, receiptHash, stateHash, balanceRecordHash, "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421", "0x3b996683504ced74d75cda750a105b987c629bbd5db0cd164cd5ed5cfa0e0bba", "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
+}
+
+//A->C
+func TestSingleAccount2Contract(t *testing.T) {
+	state := State.Copy()
+	types.SaveBalanceRecord = true
+	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+
+	sender := Bank[0].PrivateKey
+	sAdd := Bank[0].Address
+
+	amount1 := big.NewInt(0)
+	fee1 := uint64(0)
+	nonce := uint64(0)
+	tx1 := genContractCreateTx(sAdd, 1000000, nonce, "../test/token/sol/SimpleToken.bin")
+	tx1.Sign(types.GlobalSTDSigner, sender)
+	tkAdd := crypto.CreateAddress(tx1.FromAddr, tx1.Nonce(), tx1.Data())
+	nonce++
+
+	bin, err := ioutil.ReadFile("../test/token/sol/SimpleToken.abi")
+	if err != nil {
+		panic(err)
+	}
+	cabi, err := abi.JSON(bytes.NewReader(bin))
+	if err != nil {
+		panic(err)
+	}
+	var data []byte
+	method := "transfertokentest"
+	data, err = cabi.Pack(method, big.NewInt(0))
+	if err != nil {
+		panic(err)
+	}
+
+	fee2 := uint64(31539)
+	fee2i := big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee2), big.NewInt(types.ParGasPrice))
+	amount2 := big.NewInt(0)
+	ain := types.AccountSourceEntry{
+		From:   sAdd,
+		Nonce:  1,
+		Amount: fee2i,
+	}
+	aout := &types.AccountDestEntry{
+		To:     tkAdd,
+		Amount: big.NewInt(0),
 		Data:   data,
 	}
-	if !common.IsLKC(tokenID) {
-		accountDest.Amount = amount
-	}
-	dest := []types.DestEntry{accountDest}
-
-	utxoTx, _, err := types.NewAinTransaction(accountSource, dest, tokenID, nil)
+	tx2, _, err := types.NewAinTransaction(&ain, []types.DestEntry{aout}, common.EmptyAddress, nil)
 	if err != nil {
-		log.Error("getUTXOTx", "NewAinTransaction err", err)
-		return nil
+		panic(err)
 	}
-	if !common.IsLKC(tokenID) {
-		utxoTx.Fee = transferFee
-	}
-	err = utxoTx.Sign(types.GlobalSTDSigner, skey)
-	if err != nil {
-		log.Error("getUTXOTx", "Sign err", err)
-		return nil
-	}
+	tx2.Sign(types.GlobalSTDSigner, sender)
+	nonce++
 
-	return utxoTx
+	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	bfBalanceOut := []*big.Int{big.NewInt(0)}
+	block := genBlock(types.Txs{tx1, tx2})
+	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+	if err != nil {
+		panic(err)
+	}
+	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	afBalanceOut := []*big.Int{big.NewInt(0)}
+
+	expectAmount := calExpectAmount(amount1, amount2)
+	expectFee := calExpectFee(fee1, fee2)
+	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+	expectNonce := []uint64{nonce}
+	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee)
+	resultChecker(t, receipts, utxoOutputs, keyImages, 2, 0, 0)
+	othersChecker(t, expectNonce, actualNonce)
+
+	receiptHash := types.RlpHash("")
+	stateHash := state.IntermediateRoot(false)
+	balanceRecordHash := types.RlpHash("")
+	log.Debug("SAVER", "rh", receiptHash.Hex(), "sh", stateHash.Hex(), "brh", balanceRecordHash.Hex())
+	hashChecker(t, receiptHash, stateHash, balanceRecordHash, "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421", "0xa07f4b8f34bc8fec02e7daedb5944c135192d90eb068ecd3b001ffeea6ce80e0", "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
 }
 
-func genBlockUTXOTokenTransaction(height uint64, statedb *state.StateDB) *types.Block {
-	fmt.Println("account[0].address", accounts[0].Address.String())
+//A->U+
+func TestSingleAccount2MulitipleUTXO(t *testing.T) {
+	state := State.Copy()
+	types.SaveBalanceRecord = true
+	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
 
-	txs := make(types.Txs, 0)
+	sender := Bank[0].PrivateKey
+	sAdd := Bank[0].Address
+	utxo1, utxo2 := UtxoAccs[0], UtxoAccs[1]
+
+	amount1bf := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(100))
 	nonce := uint64(0)
-	demoTokenBIN := "60806040526012600160006101000a81548160ff021916908360ff16021790555034801561002c57600080fd5b50e4801561003957600080fd5b50600160009054906101000a900460ff1660ff16600a0a61271002600081905550600054e07fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f60003030600054604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a16107eb806101436000396000f300608060405260043610610083576000357c0100000000000000000000000000000000000000000000000000000000900463ffffffff16806306fdde0314610085578063313ce567146101225780633eaaf86b146101605780635d0268e61461019857806370a08231146101b8578063a4556fce1461021c578063d0ca623414610226575b005b34801561009157600080fd5b50e4801561009e57600080fd5b506100a7610230565b6040518080602001828103825283818151815260200191508051906020019080838360005b838110156100e75780820151818401526020810190506100cc565b50505050905090810190601f1680156101145780820380516001836020036101000a031916815260200191505b509250505060405180910390f35b34801561012e57600080fd5b50e4801561013b57600080fd5b5061014461026d565b604051808260ff1660ff16815260200191505060405180910390f35b34801561016c57600080fd5b50e4801561017957600080fd5b50610182610280565b6040518082815260200191505060405180910390f35b6101b660048036038101908080359060200190929190505050610286565b005b3480156101c457600080fd5b50e480156101d157600080fd5b50610206600480360381019080803573ffffffffffffffffffffffffffffffffffffffff1690602001909291905050506103b0565b6040518082815260200191505060405180910390f35b6102246103e8565b005b61022e6105cf565b005b60606040805190810160405280600981526020017f44656d6f546f6b656e0000000000000000000000000000000000000000000000815250905090565b600160009054906101000a900460ff1681565b60005481565b3073ffffffffffffffffffffffffffffffffffffffff16e273ffffffffffffffffffffffffffffffffffffffff161415156102c057600080fd5b80e41480156102cf5750600081115b15156102da57600080fd5b7fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f3330e2e4604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a150565b60008173ffffffffffffffffffffffffffffffffffffffff163073ffffffffffffffffffffffffffffffffffffffff16e19050919050565b6000e41115156103f757600080fd5b3373ffffffffffffffffffffffffffffffffffffffff163073ffffffffffffffffffffffffffffffffffffffff16e4e37fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f3330e2e4604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a17fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f303330e4604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a1565b600080341115156105df57600080fd5b6002340290503373ffffffffffffffffffffffffffffffffffffffff163073ffffffffffffffffffffffffffffffffffffffff1682e37fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f3330600034604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a17fd1398bee19313d6bf672ccb116e51f4a1a947e91c757907f51fbb5b5e56c698f30333084604051808573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018473ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020018373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff16815260200182815260200194505050505060405180910390a1505600a165627a7a7230582035535fe5dabdc379daafa902bd1a8b41026cc07fe489cad1a962214b964671dd0029"
-	contractCreateTx := genContractCreateTx(accounts[0].Address, gasLimit, nonce, demoTokenBIN)
-	nonce++
-	txs = append(txs, contractCreateTx)
-
-	app, err := initApp()
+	fee1 := types.CalNewAmountGas(amount1bf, types.EverLiankeFee)
+	fee1i := big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee1), big.NewInt(types.ParGasPrice))
+	amount1 = big.NewInt(0).Sub(amount1bf, fee1i)
+	amount1a := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(50))
+	amount1b := big.NewInt(0).Sub(amount1, amount1a)
+	ain := types.AccountSourceEntry{
+		From:   sAdd,
+		Nonce:  nonce,
+		Amount: amount1bf,
+	}
+	uout1 := types.UTXODestEntry{
+		Addr:   utxo1.Addr,
+		Amount: amount1a,
+	}
+	uout2 := types.UTXODestEntry{
+		Addr:   utxo2.Addr,
+		Amount: amount1b,
+	}
+	tx1, _, err := types.NewAinTransaction(&ain, []types.DestEntry{&uout1, &uout2}, common.EmptyAddress, nil)
 	if err != nil {
-		log.Error("initApp", "err", err)
-		return nil
+		panic(err)
+	}
+	tx1.Sign(types.GlobalSTDSigner, sender)
+	nonce++
+	balance11, _ := getBalance(tx1, lktypes.SecretKey(utxo1.Skv), lktypes.SecretKey(utxo1.Sks))
+	balance12, _ := getBalance(tx1, lktypes.SecretKey(utxo2.Skv), lktypes.SecretKey(utxo2.Sks))
+
+	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	bfBalanceOut := []*big.Int{big.NewInt(0), big.NewInt(0)}
+	block := genBlock(types.Txs{tx1})
+	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+	if err != nil {
+		panic(err)
+	}
+	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	afBalanceOut := []*big.Int{balance11, balance12}
+
+	expectAmount := calExpectAmount(amount1)
+	expectFee := calExpectFee(fee1)
+	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+	expectNonce := []uint64{nonce}
+	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee)
+	resultChecker(t, receipts, utxoOutputs, keyImages, 1, 2, 0)
+	othersChecker(t, expectNonce, actualNonce)
+
+	receiptHash := types.RlpHash("")
+	stateHash := state.IntermediateRoot(false)
+	balanceRecordHash := types.RlpHash("")
+	log.Debug("SAVER", "rh", receiptHash.Hex(), "sh", stateHash.Hex(), "brh", balanceRecordHash.Hex())
+	hashChecker(t, receiptHash, stateHash, balanceRecordHash, "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421", "0xa45746b9e991e8c9c07c2ae0db56a5639de3c089eb299b990ab8143ac4217f5e", "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
+}
+
+// //A->U+token
+// func TestSingleAccount2MulitipleUTXOToken(t *testing.T) {
+// 		state := State.Copy()
+//	types.SaveBalanceRecord = true
+//types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+
+// 	sender := Bank[0].PrivateKey
+// 	sAdd := Bank[0].Address
+// 	utxo1, utxo2 := UtxoAccs[0], UtxoAccs[1]
+
+// 	amount1 := big.NewInt(0)
+// 	fee1 := uint64(0)
+// 	nonce := uint64(0)
+// 	tx1 := genContractCreateTx(sAdd, 100000, nonce, "../test/token/sol/SimpleToken.bin")
+// 	tx1.Sign(types.GlobalSTDSigner, sender)
+// 	tkAdd := crypto.CreateAddress(tx1.FromAddr, tx1.Nonce(), tx1.Data())
+// 	nonce++
+
+// 	amount2 := big.NewInt(0)
+// 	tkamount2 := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(1))
+// 	fee2 := types.CalNewAmountGas(big.NewInt(0), types.EverLiankeFee)
+// 	//fee2i := big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee2), big.NewInt(types.ParGasPrice))
+// 	tkamount2a := big.NewInt(0).Mul(big.NewInt(1e17), big.NewInt(5))
+// 	tkamount2b := big.NewInt(0).Sub(tkamount2, tkamount2a)
+// 	ain := types.AccountSourceEntry{
+// 		From:   sAdd,
+// 		Nonce:  nonce,
+// 		Amount: tkamount2,
+// 	}
+// 	uout1 := types.UTXODestEntry{
+// 		Addr:   utxo1.Addr,
+// 		Amount: tkamount2a,
+// 	}
+// 	uout2 := types.UTXODestEntry{
+// 		Addr:   utxo2.Addr,
+// 		Amount: tkamount2b,
+// 	}
+// 	tx2, _, err := types.NewAinTransaction(&ain, []types.DestEntry{&uout1, &uout2}, tkAdd, nil)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	tx2.Sign(types.GlobalSTDSigner, sender)
+// 	nonce++
+// 	balance21, _ := getBalance(tx2, lktypes.SecretKey(utxo1.Skv), lktypes.SecretKey(utxo1.Sks))
+// 	balance22, _ := getBalance(tx2, lktypes.SecretKey(utxo2.Skv), lktypes.SecretKey(utxo2.Sks))
+
+// 	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+// 	bfBalanceOut := []*big.Int{big.NewInt(0), big.NewInt(0)}
+// 	bftkBalanceIn := []*big.Int{state.GetTokenBalance(sAdd, tkAdd)}
+// 	bftkBalanceOut := []*big.Int{big.NewInt(0), big.NewInt(0)}
+// 	block := genBlock(types.Txs{tx1, tx2})
+// 	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+// 	afBalanceOut := []*big.Int{big.NewInt(0), big.NewInt(0)}
+// 	aftkBalanceIn := []*big.Int{state.GetTokenBalance(sAdd, tkAdd)}
+// 	aftkBalanceOut := []*big.Int{balance21, balance22}
+
+// 	expectAmount := calExpectAmount(amount1, amount2)
+// 	expecttkAmount := calExpectAmount(tkamount2)
+// 	expectFee := calExpectFee(fee1, fee2)
+// 	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+// 	expectNonce := []uint64{nonce}
+// 	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+// 	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee)
+// 	balancesChecker(t, bftkBalanceIn, aftkBalanceIn, bftkBalanceOut, aftkBalanceOut, expecttkAmount, big.NewInt(0), big.NewInt(0))
+// 	resultChecker(t, receipts, utxoOutputs, keyImages, 2, 2, 0)
+// 	othersChecker(t, expectNonce, actualNonce)
+
+// }
+
+//U->A
+func TestSingleUTXO2Account(t *testing.T) {
+	state := State.Copy()
+	types.SaveBalanceRecord = true
+	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+
+	sender := Bank[0].PrivateKey
+	sAdd := Bank[0].Address
+	utxo1, utxo2 := UtxoAccs[0], UtxoAccs[1]
+
+	amount1bf := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(100))
+	nonce := uint64(0)
+	fee1 := types.CalNewAmountGas(amount1bf, types.EverLiankeFee)
+	fee1i := big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee1), big.NewInt(types.ParGasPrice))
+	amount1 = big.NewInt(0).Sub(amount1bf, fee1i)
+	amount1a := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(50))
+	amount1b := big.NewInt(0).Sub(amount1, amount1a)
+	ain := types.AccountSourceEntry{
+		From:   sAdd,
+		Nonce:  nonce,
+		Amount: amount1bf,
+	}
+	uout1 := types.UTXODestEntry{
+		Addr:   utxo1.Addr,
+		Amount: amount1a,
+	}
+	uout2 := types.UTXODestEntry{
+		Addr:   utxo2.Addr,
+		Amount: amount1b,
+	}
+	tx1, _, err := types.NewAinTransaction(&ain, []types.DestEntry{&uout1, &uout2}, common.EmptyAddress, nil)
+	if err != nil {
+		panic(err)
+	}
+	tx1.Sign(types.GlobalSTDSigner, sender)
+	nonce++
+	balance11, mask11 := getBalance(tx1, lktypes.SecretKey(utxo1.Skv), lktypes.SecretKey(utxo1.Sks))
+	balance12, _ := getBalance(tx1, lktypes.SecretKey(utxo2.Skv), lktypes.SecretKey(utxo2.Sks))
+
+	amount2bf := amount1a
+	fee2 := types.CalNewAmountGas(amount2bf, types.EverLiankeFee)
+	fee2i := big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee2), big.NewInt(types.ParGasPrice))
+	amount2 := big.NewInt(0).Sub(amount2bf, fee2i)
+	sEntey1 := &types.UTXOSourceEntry{
+		Ring: []types.UTXORingEntry{types.UTXORingEntry{
+			Index:  0,
+			OTAddr: tx1.Outputs[0].(*types.UTXOOutput).OTAddr,
+		}},
+		RingIndex: 0,
+		RKey:      tx1.RKey,
+		OutIndex:  0,
+		Amount:    balance11,
+		Mask:      mask11,
+	}
+	aDest := &types.AccountDestEntry{
+		To:     sAdd,
+		Amount: amount2,
+	}
+	tx2, ie, mk, _, err := types.NewUinTransaction(&utxo1.Acc, utxo1.Keyi, []*types.UTXOSourceEntry{sEntey1}, []types.DestEntry{aDest}, common.EmptyAddress, common.EmptyAddress, []byte{})
+	if err != nil {
+		panic(err)
+	}
+	err = types.UInTransWithRctSig(tx2, []*types.UTXOSourceEntry{sEntey1}, ie, []types.DestEntry{aDest}, mk)
+	if err != nil {
+		panic(err)
 	}
 
-	demoTokenABI := `[{"constant":true,"inputs":[],"name":"name","outputs":[{"name":"","type":"string"}],"payable":false,"stateMutability":"pure","type":"function"},{"constant":true,"inputs":[],"name":"decimals","outputs":[{"name":"","type":"uint8"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":true,"inputs":[],"name":"_totalSupply","outputs":[{"name":"","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[{"name":"value","type":"uint256"}],"name":"addOrder","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"constant":true,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"payable":false,"stateMutability":"view","type":"function"},{"constant":false,"inputs":[],"name":"exchangebytoken","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"constant":false,"inputs":[],"name":"exchangebylk","outputs":[],"payable":true,"stateMutability":"payable","type":"function"},{"inputs":[],"payable":false,"stateMutability":"nonpayable","type":"constructor"},{"payable":true,"stateMutability":"payable","type":"fallback"},{"anonymous":false,"inputs":[{"indexed":false,"name":"from","type":"address"},{"indexed":false,"name":"to","type":"address"},{"indexed":false,"name":"token","type":"address"},{"indexed":false,"name":"value","type":"uint256"}],"name":"Transfer","type":"event"}]`
+	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	bfBalanceOut := []*big.Int{big.NewInt(0)}
+	block := genBlock(types.Txs{tx1, tx2})
+	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+	if err != nil {
+		panic(err)
+	}
+	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	afBalanceOut := []*big.Int{balance12}
+
+	expectAmount := calExpectAmount(amount1b)
+	expectFee := calExpectFee(fee1, fee2)
+	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+	expectNonce := []uint64{nonce}
+	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee) //#1
+	resultChecker(t, receipts, utxoOutputs, keyImages, 2, 2, 1)
+	othersChecker(t, expectNonce, actualNonce)
+
+	for _, rece := range receipts {
+		rece.TxHash = common.EmptyHash
+	}
+
+	receiptHash := types.RlpHash("")
+	stateHash := state.IntermediateRoot(false)
+	balanceRecordHash := types.RlpHash("")
+	log.Debug("SAVER", "rh", receiptHash.Hex(), "sh", stateHash.Hex(), "brh", balanceRecordHash.Hex())
+	hashChecker(t, receiptHash, stateHash, balanceRecordHash, "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421", "0xf7d85ce7bfdd37a2d5e6dede947a97576011041a85b2d383e354877a90a39f2c", "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
+}
+
+//U->M
+func TestSingleUTXO2Mix(t *testing.T) {
+	state := State.Copy()
+	types.SaveBalanceRecord = true
+	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+
+	sender := Bank[0].PrivateKey
+	sAdd := Bank[0].Address
+	utxo1, utxo2 := UtxoAccs[0], UtxoAccs[1]
+
+	amount1bf := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(100))
+	fee1 := types.CalNewAmountGas(amount1bf, types.EverLiankeFee)
+	fee1i := big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee1), big.NewInt(types.ParGasPrice))
+	amount1 := big.NewInt(0).Sub(amount1bf, fee1i)
+	amount1a := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(90))
+	amount1b := big.NewInt(0).Sub(amount1, amount1a)
+	nonce := uint64(0)
+	ain := types.AccountSourceEntry{
+		From:   sAdd,
+		Nonce:  nonce,
+		Amount: amount1bf,
+	}
+	uout1 := types.UTXODestEntry{
+		Addr:   utxo1.Addr,
+		Amount: amount1a,
+	}
+	uout2 := types.UTXODestEntry{
+		Addr:   utxo2.Addr,
+		Amount: amount1b,
+	}
+	tx1, _, err := types.NewAinTransaction(&ain, []types.DestEntry{&uout1, &uout2}, common.EmptyAddress, nil)
+	if err != nil {
+		panic(err)
+	}
+	tx1.Sign(types.GlobalSTDSigner, sender)
+	nonce++
+	balance11, mask11 := getBalance(tx1, lktypes.SecretKey(utxo1.Skv), lktypes.SecretKey(utxo1.Sks))
+	balance12, _ := getBalance(tx1, lktypes.SecretKey(utxo2.Skv), lktypes.SecretKey(utxo2.Sks))
+
+	sEntey1 := &types.UTXOSourceEntry{
+		Ring: []types.UTXORingEntry{types.UTXORingEntry{
+			Index:  0,
+			OTAddr: tx1.Outputs[0].(*types.UTXOOutput).OTAddr,
+		}},
+		RingIndex: 0,
+		RKey:      tx1.RKey,
+		OutIndex:  0,
+		Amount:    balance11,
+		Mask:      mask11,
+	}
+
+	amount2bf := amount1a
+	fee2 := types.CalNewAmountGas(amount2bf, types.EverLiankeFee) + uint64(5e8)
+	fee2i := big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee2), big.NewInt(types.ParGasPrice))
+	amount2 := big.NewInt(0).Sub(amount2bf, fee2i)
+	amount2a := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(10))
+	amount2b := big.NewInt(0).Sub(amount2, amount2a)
+	aDest := &types.AccountDestEntry{
+		To:     sAdd,
+		Amount: amount2a,
+	}
+	uDest := &types.UTXODestEntry{
+		Addr:   uout2.Addr,
+		Amount: amount2b,
+	}
+	tx2, ie, mk, _, err := types.NewUinTransaction(&utxo1.Acc, utxo1.Keyi, []*types.UTXOSourceEntry{sEntey1}, []types.DestEntry{aDest, uDest}, common.EmptyAddress, common.EmptyAddress, []byte{})
+	if err != nil {
+		panic(err)
+	}
+	err = types.UInTransWithRctSig(tx2, []*types.UTXOSourceEntry{sEntey1}, ie, []types.DestEntry{aDest, uDest}, mk)
+	if err != nil {
+		panic(err)
+	}
+	balance22, _ := getBalance(tx2, lktypes.SecretKey(utxo2.Skv), lktypes.SecretKey(utxo2.Sks))
+
+	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	bfBalanceOut := []*big.Int{big.NewInt(0), big.NewInt(0)}
+	block := genBlock(types.Txs{tx1, tx2})
+	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+	if err != nil {
+		panic(err)
+	}
+	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+	afBalanceOut := []*big.Int{balance12, balance22}
+
+	expectAmount := calExpectAmount(amount1b, amount2b)
+	expectFee := calExpectFee(fee1, fee2)
+	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+	expectNonce := []uint64{nonce}
+	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee) //#1
+	resultChecker(t, receipts, utxoOutputs, keyImages, 2, 3, 1)
+	othersChecker(t, expectNonce, actualNonce)
+
+	receiptHash := types.RlpHash("")
+	stateHash := state.IntermediateRoot(false)
+	balanceRecordHash := types.RlpHash("")
+	log.Debug("SAVER", "rh", receiptHash.Hex(), "sh", stateHash.Hex(), "brh", balanceRecordHash.Hex())
+	hashChecker(t, receiptHash, stateHash, balanceRecordHash, "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421", "0x911304550f7dcf2d6b05f7d1cb86794d076627fa51b799219ef98d18d891ca14", "0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")
+}
+
+// //U->M token
+// func TestSingleUTXO2MixToken2(t *testing.T) {
+// 		state := State.Copy()
+//	types.SaveBalanceRecord = true
+//	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+
+// 	sender := Bank[0].PrivateKey
+// 	sAdd := Bank[0].Address
+// 	utxo1, utxo2 := UtxoAccs[0], UtxoAccs[1]
+
+// 	amount1 := big.NewInt(0)
+// 	fee1 := uint64(0)
+// 	nonce := uint64(0)
+// 	tx1 := genContractCreateTx(sAdd, 100000, nonce, "../test/token/sol/SimpleToken.bin")
+// 	tx1.Sign(types.GlobalSTDSigner, sender)
+// 	tkAdd := crypto.CreateAddress(tx1.FromAddr, tx1.Nonce(), tx1.Data())
+// 	nonce++
+
+// 	amount2 := big.NewInt(0)
+// 	fee2 := types.CalNewAmountGas(big.NewInt(0), types.EverLiankeFee)
+// 	//fee2i := big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee2), big.NewInt(types.ParGasPrice))
+// 	tkamount2 := big.NewInt(10000)
+// 	tkamount2a := big.NewInt(9999)
+// 	tkamount2b := big.NewInt(0).Sub(tkamount2, tkamount2a)
+// 	ain := types.AccountSourceEntry{
+// 		From:   sAdd,
+// 		Nonce:  nonce,
+// 		Amount: tkamount2,
+// 	}
+// 	uout1 := types.UTXODestEntry{
+// 		Addr:   utxo1.Addr,
+// 		Amount: tkamount2a,
+// 	}
+// 	uout2 := types.UTXODestEntry{
+// 		Addr:   utxo2.Addr,
+// 		Amount: tkamount2b,
+// 	}
+// 	tx2, _, err := types.NewAinTransaction(&ain, []types.DestEntry{&uout1, &uout2}, tkAdd, nil)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	tx2.Sign(types.GlobalSTDSigner, sender)
+// 	nonce++
+// 	balance21, mask21 := getBalance(tx2, lktypes.SecretKey(utxo1.Skv), lktypes.SecretKey(utxo1.Sks))
+// 	balance22, _ := getBalance(tx2, lktypes.SecretKey(utxo2.Skv), lktypes.SecretKey(utxo2.Sks))
+
+// 	amount3 := big.NewInt(0)
+// 	fee3 := types.CalNewAmountGas(big.NewInt(0), types.EverLiankeFee) + uint64(5e8)
+// 	//fee3i := big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee3), big.NewInt(types.ParGasPrice))
+// 	tkamount3 := tkamount2a
+// 	tkamount3a := big.NewInt(3000)
+// 	tkamount3b := big.NewInt(0).Sub(tkamount3, tkamount3a)
+// 	sEntey1 := &types.UTXOSourceEntry{
+// 		Ring: []types.UTXORingEntry{types.UTXORingEntry{
+// 			Index:  0,
+// 			OTAddr: tx2.Outputs[0].(*types.UTXOOutput).OTAddr,
+// 		}},
+// 		RingIndex: 0,
+// 		RKey:      tx2.RKey,
+// 		OutIndex:  0,
+// 		Amount:    balance21,
+// 		Mask:      mask21,
+// 	}
+// 	aDest := &types.AccountDestEntry{
+// 		To:     sAdd,
+// 		Amount: tkamount3a,
+// 	}
+// 	uDest := &types.UTXODestEntry{
+// 		Addr:   uout2.Addr,
+// 		Amount: tkamount3b,
+// 	}
+// 	tx3, ie, mk, _, err := types.NewUinTransaction(&utxo1.Acc, utxo1.Keyi, []*types.UTXOSourceEntry{sEntey1}, []types.DestEntry{aDest, uDest}, tkAdd, common.EmptyAddress, nil)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	tx3.Sign(types.GlobalSTDSigner, sender)
+// 	err = types.UInTransWithRctSig(tx3, []*types.UTXOSourceEntry{sEntey1}, ie, []types.DestEntry{aDest, uDest}, mk)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	nonce++
+// 	balance32, _ := getBalance(tx3, lktypes.SecretKey(utxo2.Skv), lktypes.SecretKey(utxo2.Sks))
+
+// 	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+// 	bftkBalanceIn := []*big.Int{state.GetTokenBalance(sAdd, tkAdd)}
+// 	bfBalanceOut := []*big.Int{}
+// 	bftkBalanceOut := []*big.Int{big.NewInt(0), big.NewInt(0)}
+// 	block := genBlock(types.Txs{tx1, tx2, tx3})
+// 	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+// 	aftkBalanceIn := []*big.Int{state.GetTokenBalance(sAdd, tkAdd)}
+// 	afBalanceOut := []*big.Int{}
+// 	aftkBalanceOut := []*big.Int{balance22, balance32}
+
+// 	expectAmount := calExpectAmount(amount1, amount2, amount3)
+// 	expecttkAmount := calExpectAmount(tkamount2b, tkamount3b)
+// 	expectFee := calExpectFee(fee1, fee2, fee3)
+// 	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+// 	expectNonce := []uint64{nonce}
+// 	actualNonce := []uint64{state.GetNonce(sAdd)}
+
+// 	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, expectAmount, expectFee, actualFee)
+// 	balancesChecker(t, bftkBalanceIn, aftkBalanceIn, bftkBalanceOut, aftkBalanceOut, expecttkAmount, big.NewInt(0), big.NewInt(0))
+// 	resultChecker(t, receipts, utxoOutputs, keyImages, 3, 3, 1)
+// 	othersChecker(t, expectNonce, actualNonce)
+// }
+
+// //U->C
+// func TestSingleUTXO2Contract(t *testing.T) {
+// 		state := State.Copy()
+//	types.SaveBalanceRecord = true
+//	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+// 	sender := Bank[0].PrivateKey
+
+// 	sAdd := crypto.PubkeyToAddress(sender.PublicKey)
+
+// 	bfBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+// 	bfBalanceOut := []*big.Int{big.NewInt(0)}
+
+// 	tx1 := genContractCreateTx(sAdd, 1000000, 0, "../test/token/sol/SimpleToken.bin")
+// 	tx1.Sign(types.GlobalSTDSigner, sender)
+// 	tkAdd := crypto.CreateAddress(tx1.FromAddr, tx1.Nonce(), tx1.Data())
+// 	expectFee1 := big.NewInt(0)
+
+// 	amount := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(100))
+// 	ain := types.AccountSourceEntry{
+// 		From:   sAdd,
+// 		Nonce:  1,
+// 		Amount: amount,
+// 	}
+// 	fee := types.CalNewAmountGas(amount, types.EverLiankeFee)
+// 	expectFee2 := big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee), big.NewInt(types.ParGasPrice))
+// 	fee3 := uint64(31539)
+// 	expectFee3 := big.NewInt(0).Add(big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee3), big.NewInt(types.ParGasPrice)), big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(50)))
+
+// 	amount = big.NewInt(0).Sub(amount, expectFee2)
+// 	amount1 := expectFee3 //big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(51))
+
+// 	amount2 := big.NewInt(0).Sub(amount, amount1)
+
+// 	sks1, pks1 := xcrypto.SkpkGen()
+// 	skv1, pkv1 := xcrypto.SkpkGen()
+// 	sks2, pks2 := xcrypto.SkpkGen()
+// 	skv2, pkv2 := xcrypto.SkpkGen()
+
+// 	rAddr1 := lktypes.AccountAddress{
+// 		ViewPublicKey:  lktypes.PublicKey(pkv1),
+// 		SpendPublicKey: lktypes.PublicKey(pks1),
+// 	}
+// 	rAddr2 := lktypes.AccountAddress{
+// 		ViewPublicKey:  lktypes.PublicKey(pkv2),
+// 		SpendPublicKey: lktypes.PublicKey(pks2),
+// 	}
+// 	var remark [32]byte
+// 	uout1 := types.UTXODestEntry{
+// 		Addr:         rAddr1,
+// 		Amount:       amount1,
+// 		IsSubaddress: false,
+// 		IsChange:     false,
+// 		Remark:       remark,
+// 	}
+// 	uout2 := types.UTXODestEntry{
+// 		Addr:         rAddr2,
+// 		Amount:       amount2,
+// 		IsSubaddress: false,
+// 		IsChange:     false,
+// 		Remark:       remark,
+// 	}
+
+// 	tx2, _, err := types.NewAinTransaction(&ain, []types.DestEntry{&uout1, &uout2}, common.EmptyAddress, expectFee2, nil)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	err = tx2.Sign(types.GlobalSTDSigner, sender)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	sEntey1 := &types.UTXOSourceEntry{
+// 		Ring: []types.UTXORingEntry{types.UTXORingEntry{
+// 			Index:  0,
+// 			OTAddr: tx2.Outputs[0].(*types.UTXOOutput).OTAddr,
+// 			Commit: tx2.Outputs[0].(*types.UTXOOutput).Remark,
+// 		}},
+// 		RingIndex: 0,
+// 		RKey:      tx2.RKey,
+// 		OutIndex:  0,
+// 		Amount:    big.NewInt(0).Set(amount1),
+// 		Mask:      tx2.RCTSig.RctSigBase.EcdhInfo[0].Mask,
+// 	}
+
+// 	acc1 := lktypes.AccountKey{
+// 		Addr: lktypes.AccountAddress{
+// 			SpendPublicKey: lktypes.PublicKey(pks1),
+// 			ViewPublicKey:  lktypes.PublicKey(pkv1),
+// 		},
+// 		SpendSKey: lktypes.SecretKey(sks1),
+// 		ViewSKey:  lktypes.SecretKey(skv1),
+// 		SubIdx:    uint64(0),
+// 	}
+// 	address := wallet.AddressToStr(&acc1, uint64(0))
+// 	acc1.Address = address
+// 	keyi1 := make(map[lktypes.PublicKey]uint64)
+// 	keyi1[acc1.Addr.SpendPublicKey] = 0
+
+// 	//var cabi abi.ABI
+// 	bin, err := ioutil.ReadFile("../test/token/sol/SimpleToken.abi")
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	cabi, err := abi.JSON(bytes.NewReader(bin))
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	var data []byte
+// 	method := "transfertokentest"
+// 	data, err = cabi.Pack(method, big.NewInt(0))
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	aDest := &types.AccountDestEntry{
+// 		To:     tkAdd,
+// 		Amount: big.NewInt(0),
+// 		Data:   data,
+// 	}
+
+// 	tx3, ie, mk, _, err := types.NewUinTransaction(&acc1, keyi1, []*types.UTXOSourceEntry{sEntey1}, []types.DestEntry{aDest}, common.EmptyAddress, sAdd, expectFee3, []byte{})
+// 	tx3.Sign(types.GlobalSTDSigner, sender)
+// 	err = types.UInTransWithRctSig(tx2, []*types.UTXOSourceEntry{sEntey1}, ie, []types.DestEntry{aDest}, mk)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	block := genBlock(types.Txs{tx1, tx2, tx3})
+// 	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	afBalanceIn := []*big.Int{state.GetBalance(sAdd)}
+// 	afBalanceOut := []*big.Int{getBalance(tx2, lktypes.SecretKey(skv2), lktypes.SecretKey(sks2))}
+
+// 	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+
+// 	amount = amount2
+// 	expectFee := big.NewInt(0).Add(big.NewInt(0).Add(expectFee1, expectFee2), expectFee3)
+// 	println(bfBalanceIn[0].String(), afBalanceIn[0].String(), bfBalanceOut[0].String(), afBalanceOut[0].String(), amount.String(), expectFee.String(), actualFee.String())
+// 	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, amount, expectFee, actualFee)
+// 	resultChecker(t, receipts, utxoOutputs, keyImages, 3, 2, 1)
+// }
+
+// //U->C2 (value transfer)
+// func TestSingleUTXO2Contract2(t *testing.T) {
+// 		state := State.Copy()
+//	types.SaveBalanceRecord = true
+//	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+// 	sender := Bank[0].PrivateKey
+
+// 	sAdd := crypto.PubkeyToAddress(sender.PublicKey)
+
+// 	bfBalanceIn := []*big.Int{state.GetBalance(sAdd), big.NewInt(0)}
+// 	bfBalanceOut := []*big.Int{big.NewInt(0), big.NewInt(0)}
+
+// 	tx1 := genContractCreateTx(sAdd, 1000000, 0, "../test/token/sol/t.bin")
+// 	tx1.Sign(types.GlobalSTDSigner, sender)
+// 	tkAdd := crypto.CreateAddress(tx1.FromAddr, tx1.Nonce(), tx1.Data())
+// 	expectFee1 := big.NewInt(0)
+
+// 	amount := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(1000))
+// 	ain := types.AccountSourceEntry{
+// 		From:   sAdd,
+// 		Nonce:  1,
+// 		Amount: amount,
+// 	}
+// 	fee := types.CalNewAmountGas(amount, types.EverLiankeFee)
+// 	expectFee2 := big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee), big.NewInt(types.ParGasPrice))
+// 	amount = big.NewInt(0).Sub(amount, expectFee2)
+// 	amount1 := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(500))
+// 	amount2 := big.NewInt(0).Sub(amount, amount1)
+
+// 	sks1, pks1 := xcrypto.SkpkGen()
+// 	skv1, pkv1 := xcrypto.SkpkGen()
+// 	sks2, pks2 := xcrypto.SkpkGen()
+// 	skv2, pkv2 := xcrypto.SkpkGen()
+
+// 	rAddr1 := lktypes.AccountAddress{
+// 		ViewPublicKey:  lktypes.PublicKey(pkv1),
+// 		SpendPublicKey: lktypes.PublicKey(pks1),
+// 	}
+// 	rAddr2 := lktypes.AccountAddress{
+// 		ViewPublicKey:  lktypes.PublicKey(pkv2),
+// 		SpendPublicKey: lktypes.PublicKey(pks2),
+// 	}
+// 	var remark [32]byte
+// 	uout1 := types.UTXODestEntry{
+// 		Addr:         rAddr1,
+// 		Amount:       amount1,
+// 		IsSubaddress: false,
+// 		IsChange:     false,
+// 		Remark:       remark,
+// 	}
+// 	uout2 := types.UTXODestEntry{
+// 		Addr:         rAddr2,
+// 		Amount:       amount2,
+// 		IsSubaddress: false,
+// 		IsChange:     false,
+// 		Remark:       remark,
+// 	}
+
+// 	tx2, _, err := types.NewAinTransaction(&ain, []types.DestEntry{&uout1, &uout2}, common.EmptyAddress, expectFee2, nil)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	err = tx2.Sign(types.GlobalSTDSigner, sender)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	sEntey1 := &types.UTXOSourceEntry{
+// 		Ring: []types.UTXORingEntry{types.UTXORingEntry{
+// 			Index:  0,
+// 			OTAddr: tx2.Outputs[0].(*types.UTXOOutput).OTAddr,
+// 			Commit: tx2.Outputs[0].(*types.UTXOOutput).Remark,
+// 		}},
+// 		RingIndex: 0,
+// 		RKey:      tx2.RKey,
+// 		OutIndex:  0,
+// 		Amount:    big.NewInt(0).Set(amount1),
+// 		Mask:      tx2.RCTSig.RctSigBase.EcdhInfo[0].Mask,
+// 	}
+
+// 	acc1 := lktypes.AccountKey{
+// 		Addr: lktypes.AccountAddress{
+// 			SpendPublicKey: lktypes.PublicKey(pks1),
+// 			ViewPublicKey:  lktypes.PublicKey(pkv1),
+// 		},
+// 		SpendSKey: lktypes.SecretKey(sks1),
+// 		ViewSKey:  lktypes.SecretKey(skv1),
+// 		SubIdx:    uint64(0),
+// 	}
+// 	address := wallet.AddressToStr(&acc1, uint64(0))
+// 	acc1.Address = address
+// 	keyi1 := make(map[lktypes.PublicKey]uint64)
+// 	keyi1[acc1.Addr.SpendPublicKey] = 0
+
+// 	//var cabi abi.ABI
+// 	bin, err := ioutil.ReadFile("../test/token/sol/t.abi")
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	cabi, err := abi.JSON(bytes.NewReader(bin))
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	var data []byte
+// 	method := "set"
+// 	data, err = cabi.Pack(method, big.NewInt(0))
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	amount3 := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(100))
+// 	aDest := &types.AccountDestEntry{
+// 		To:     tkAdd,
+// 		Amount: amount3,
+// 		Data:   data,
+// 	}
+// 	fee3 := uint64(26596)
+// 	expectFee3 := big.NewInt(0).Add(big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee3), big.NewInt(types.ParGasPrice)), big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(50)))
+
+// 	txfee3 := big.NewInt(0).Sub(amount1, amount3)
+// 	tx3, ie, mk, _, err := types.NewUinTransaction(&acc1, keyi1, []*types.UTXOSourceEntry{sEntey1}, []types.DestEntry{aDest}, common.EmptyAddress, sAdd, txfee3, []byte{})
+// 	tx3.Sign(types.GlobalSTDSigner, sender)
+// 	err = types.UInTransWithRctSig(tx2, []*types.UTXOSourceEntry{sEntey1}, ie, []types.DestEntry{aDest}, mk)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	block := genBlock(types.Txs{tx1, tx2, tx3})
+// 	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+// 	if err != nil {
+// 		panic(err)
+// 	}
+
+// 	afBalanceIn := []*big.Int{state.GetBalance(sAdd), big.NewInt(0)}
+// 	afBalanceOut := []*big.Int{getBalance(tx2, lktypes.SecretKey(skv2), lktypes.SecretKey(sks2)), state.GetBalance(tkAdd)}
+
+// 	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+
+// 	amount = big.NewInt(0).Add(amount2, amount3)
+// 	expectFee := big.NewInt(0).Add(big.NewInt(0).Add(expectFee1, expectFee2), expectFee3)
+// 	println(expectFee1.String(), expectFee2.String(), expectFee3.String(), actualFee.String())
+// 	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, amount, expectFee, actualFee)
+// 	resultChecker(t, receipts, utxoOutputs, keyImages, 3, 2, 1)
+
+// }
+
+//U->C2E (value transfer gas usage test) this test is designated to throw err
+/*
+func TestSingleUTXO2Contract3(t *testing.T) {
+		state := State.Copy()
+	types.SaveBalanceRecord = true
+	types.BlockBalanceRecordsInstance = types.NewBlockBalanceRecords()
+	sender := Bank[0].PrivateKey
+
+	sAdd := crypto.PubkeyToAddress(sender.PublicKey)
+
+	bfBalanceIn := []*big.Int{state.GetBalance(sAdd), big.NewInt(0)}
+	bfBalanceOut := []*big.Int{big.NewInt(0), big.NewInt(0)}
+
+	tx1 := genContractCreateTx(sAdd, 1000000, 0, "../test/token/sol/t.bin")
+	tx1.Sign(types.GlobalSTDSigner, sender)
+	tkAdd := crypto.CreateAddress(tx1.FromAddr, tx1.Nonce(), tx1.Data())
+	expectFee1 := big.NewInt(0)
+
+	amount := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(1000))
+	ain := types.AccountSourceEntry{
+		From:   sAdd,
+		Nonce:  1,
+		Amount: amount,
+	}
+	fee := types.CalNewAmountGas(amount, types.EverLiankeFee)
+	expectFee2 := big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee), big.NewInt(types.ParGasPrice))
+	amount = big.NewInt(0).Sub(amount, expectFee2)
+	amount1 := big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(500))
+	amount2 := big.NewInt(0).Sub(amount, amount1)
+
+	sks1, pks1 := xcrypto.SkpkGen()
+	skv1, pkv1 := xcrypto.SkpkGen()
+	sks2, pks2 := xcrypto.SkpkGen()
+	skv2, pkv2 := xcrypto.SkpkGen()
+
+	rAddr1 := lktypes.AccountAddress{
+		ViewPublicKey:  lktypes.PublicKey(pkv1),
+		SpendPublicKey: lktypes.PublicKey(pks1),
+	}
+	rAddr2 := lktypes.AccountAddress{
+		ViewPublicKey:  lktypes.PublicKey(pkv2),
+		SpendPublicKey: lktypes.PublicKey(pks2),
+	}
+	var remark [32]byte
+	uout1 := types.UTXODestEntry{
+		Addr:         rAddr1,
+		Amount:       amount1,
+		IsSubaddress: false,
+		IsChange:     false,
+		Remark:       remark,
+	}
+	uout2 := types.UTXODestEntry{
+		Addr:         rAddr2,
+		Amount:       amount2,
+		IsSubaddress: false,
+		IsChange:     false,
+		Remark:       remark,
+	}
+
+	tx2, _, err := types.NewAinTransaction(&ain, []types.DestEntry{&uout1, &uout2}, common.EmptyAddress, expectFee2, nil)
+	if err != nil {
+		panic(err)
+	}
+	err = tx2.Sign(types.GlobalSTDSigner, sender)
+	if err != nil {
+		panic(err)
+	}
+	sEntey1 := &types.UTXOSourceEntry{
+		Ring: []types.UTXORingEntry{types.UTXORingEntry{
+			Index:  0,
+			OTAddr: tx2.Outputs[0].(*types.UTXOOutput).OTAddr,
+			Commit: tx2.Outputs[0].(*types.UTXOOutput).Remark,
+		}},
+		RingIndex: 0,
+		RKey:      tx2.RKey,
+		OutIndex:  0,
+		Amount:    big.NewInt(0).Set(amount1),
+		Mask:      tx2.RCTSig.RctSigBase.EcdhInfo[0].Mask,
+	}
+
+	acc1 := lktypes.AccountKey{
+		Addr: lktypes.AccountAddress{
+			SpendPublicKey: lktypes.PublicKey(pks1),
+			ViewPublicKey:  lktypes.PublicKey(pkv1),
+		},
+		SpendSKey: lktypes.SecretKey(sks1),
+		ViewSKey:  lktypes.SecretKey(skv1),
+		SubIdx:    uint64(0),
+	}
+	address := wallet.AddressToStr(&acc1, uint64(0))
+	acc1.Address = address
+	keyi1 := make(map[lktypes.PublicKey]uint64)
+	keyi1[acc1.Addr.SpendPublicKey] = 0
 
 	//var cabi abi.ABI
-	cabi, err := abi.JSON(bytes.NewReader([]byte(demoTokenABI)))
+	bin, err := ioutil.ReadFile("../test/token/sol/t.abi")
 	if err != nil {
 		panic(err)
 	}
-
-	fromaddr, _ := contractCreateTx.From()
-	contractAddr := crypto.CreateAddress(fromaddr, contractCreateTx.Nonce(), contractCreateTx.Data())
-	log.Debug("", "contractAddr", contractAddr.String())
+	cabi, err := abi.JSON(bytes.NewReader(bin))
+	if err != nil {
+		panic(err)
+	}
 	var data []byte
-	method := "exchangebylk"
-	data, err = cabi.Pack(method)
-	log.Debug("", "method data", fmt.Sprintf("0x%x", data))
+	method := "set"
+	data, err = cabi.Pack(method, big.NewInt(0))
 	if err != nil {
 		panic(err)
 	}
-	utxoTx1 := getUTXOTokenTx(accounts[0].PrivateKey, contractAddr, common.EmptyAddress, nonce, big.NewInt(10000000e11), data)
-	nonce++
-	if err := utxoTx1.CheckBasic(app); err != nil {
-		log.Error("CheckBasic", "err", err)
+	fee3 := uint64(26596) + uint64(5e8)
+	expectFee3 := big.NewInt(0).Mul(big.NewInt(0).SetUint64(fee3), big.NewInt(types.ParGasPrice))
+	amount3 := big.NewInt(0).Sub(amount1, big.NewInt(0).Sub(expectFee3, big.NewInt(1e11))) //big.NewInt(0).Mul(big.NewInt(1e18), big.NewInt(100))
+	aDest := &types.AccountDestEntry{
+		To:     tkAdd,
+		Amount: amount3,
+		Data:   data,
 	}
-	txs = append(txs, utxoTx1)
 
-	method = "exchangebytoken"
-	data, err = cabi.Pack(method)
-	log.Debug("", "method data", fmt.Sprintf("0x%x", data))
+	tx3, ie, mk, _, err := types.NewUinTransaction(&acc1, keyi1, []*types.UTXOSourceEntry{sEntey1}, []types.DestEntry{aDest}, common.EmptyAddress, sAdd, expectFee3, []byte{})
+	tx3.Sign(types.GlobalSTDSigner, sender)
+	err = types.UInTransWithRctSig(tx2, []*types.UTXOSourceEntry{sEntey1}, ie, []types.DestEntry{aDest}, mk)
 	if err != nil {
 		panic(err)
 	}
-	utxoTx2 := getUTXOTokenTx(accounts[0].PrivateKey, contractAddr, contractAddr, nonce, big.NewInt(10000000e11), data)
-	nonce++
-	if err := utxoTx2.CheckBasic(app); err != nil {
-		log.Error("CheckBasic", "err", err)
-	}
-	txs = append(txs, utxoTx2)
-
-	block := &types.Block{
-		Header: &types.Header{
-			Height:     height,
-			Coinbase:   coinbase,
-			Time:       uint64(time.Now().Unix()),
-			NumTxs:     uint64(len(txs)),
-			TotalTxs:   uint64(len(txs)),
-			ParentHash: common.EmptyHash,
-			GasLimit:   1e19,
-		},
-		Data: &types.Data{
-			Txs: txs,
-		},
+	if err != nil {
+		panic(err)
 	}
 
-	return block
+	block := genBlock(types.Txs{tx1, tx2, tx3})
+	receipts, _, blockGas, _, utxoOutputs, keyImages, err := SP.Process(block, state, VC)
+	if err != nil {
+		panic(err)
+	}
+
+	afBalanceIn := []*big.Int{state.GetBalance(sAdd), big.NewInt(0)}
+	afBalanceOut := []*big.Int{getBalance(tx2, lktypes.SecretKey(skv2), lktypes.SecretKey(sks2)), state.GetBalance(tkAdd)}
+
+	actualFee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(blockGas), big.NewInt(types.ParGasPrice))
+
+	amount = big.NewInt(0).Add(amount2, amount3)
+	expectFee := big.NewInt(0).Add(big.NewInt(0).Add(expectFee1, expectFee2), expectFee3)
+	println(expectFee1.String(), expectFee2.String(), expectFee3.String(), actualFee.String())
+	balancesChecker(t, bfBalanceIn, afBalanceIn, bfBalanceOut, afBalanceOut, amount, expectFee, actualFee)
+	resultChecker(t, receipts, utxoOutputs, keyImages, 3, 2, 1)
 }
+*/

@@ -110,7 +110,7 @@ func NewLinkApplication(db dbm.DB, bc *blockchain.BlockStore, utxoStore *utxo.Ut
 	}
 
 	app := &LinkApplication{
-		logger:             log.NewNopLogger(),
+		logger:             log.Root(), //log.NewNopLogger(),
 		vmConfig:           evm.Config{EnablePreimageRecording: false},
 		blockChain:         bc,
 		balanceRecordStore: brs,
@@ -270,7 +270,7 @@ func (app *LinkApplication) CheckBlock(block *types.Block) bool {
 	}
 
 	if err := app.verifySpecTxSign(block); err != nil {
-		app.logger.Error("CheckBlock: verify signature failed:", err)
+		app.logger.Error("CheckBlock: verify signature failed:", "err", err)
 		return false
 	}
 
@@ -411,7 +411,7 @@ func (app *LinkApplication) verifyTxsOnProcess(block *types.Block) error {
 							}
 						}
 					}
-					if (tx.UTXOKind() & types.Ain) == types.Ain {
+					if (tx.UTXOKind()&types.Ain) == types.Ain || !common.IsLKC(tx.TokenAddress()) {
 						fromAddr, err := tx.From()
 						if err != nil {
 							fromAddr = common.EmptyAddress
