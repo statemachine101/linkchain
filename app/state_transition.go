@@ -170,16 +170,18 @@ func (tx *processTransaction) buyGas() (err error) { // default use Input[0] to 
 	if tx.Type == types.TxUTXO && common.IsLKC(tx.TokenAddress) { // lkc utxo bypass
 		return
 	}
-	if tx.RefundAddr != common.EmptyAddress {
-		mgval := new(big.Int).Mul(new(big.Int).SetUint64(tx.Gas), tx.GasPrice)
-		from := tx.RefundAddr
-		if tx.State.GetBalance(from).Cmp(mgval) < 0 {
-			log.Warn("buyGas: not enough gas", "hash", tx.Hash, "needval", mgval, "balance", tx.State.GetBalance(from))
-			return errInsufficientBalanceForGas
-		}
-		tx.State.SubBalance(from, mgval)
-		log.Debug("buyGas", "hash", tx.Hash, "needval", mgval, "balance", tx.State.GetBalance(from))
+	if tx.RefundAddr == common.EmptyAddress {
+		return
 	}
+
+	mgval := new(big.Int).Mul(new(big.Int).SetUint64(tx.Gas), tx.GasPrice)
+	from := tx.RefundAddr
+	if tx.State.GetBalance(from).Cmp(mgval) < 0 {
+		log.Warn("buyGas: not enough gas", "hash", tx.Hash, "needval", mgval, "balance", tx.State.GetBalance(from))
+		return errInsufficientBalanceForGas
+	}
+	tx.State.SubBalance(from, mgval)
+	log.Debug("buyGas", "hash", tx.Hash, "needval", mgval, "balance", tx.State.GetBalance(from))
 	return
 }
 
@@ -188,8 +190,12 @@ func (tx *processTransaction) payIntrinsicGas() (err error) {
 	var intrinsicGasSum uint64
 	for _, aout := range tx.Outputs {
 		if aout.Type == Createout || aout.Type == Updateout {
-			intrinsicGas, err = IntrinsicGas(aout.Data, true, cfg.WasmGasRate)
-			if err != nil {
+			data := aout.Data
+			gasRate := cfg.EvmGasRate
+			if wasm.IsWasmContract(data) {
+				gasRate = cfg.WasmGasRate
+			}
+			if intrinsicGas, err = IntrinsicGas(aout.Data, true, gasRate); err != nil {
 				return
 			}
 			if (math.MaxUint64 - intrinsicGasSum) <= intrinsicGas {
@@ -202,7 +208,9 @@ func (tx *processTransaction) payIntrinsicGas() (err error) {
 			if wasm.IsWasmContract(data) {
 				gasRate = cfg.WasmGasRate
 			}
-			intrinsicGas, err = IntrinsicGas(aout.Data, false, gasRate)
+			if intrinsicGas, err = IntrinsicGas(aout.Data, false, gasRate); err != nil {
+				return
+			}
 			if (math.MaxUint64 - intrinsicGasSum) <= intrinsicGas {
 				return errIntrinsicGasOverflow
 			}
@@ -250,9 +258,9 @@ func (tx *processTransaction) payTransferGas() (transferGas uint64, vmerr error)
 	}
 	if vmerr = tx.useGas(transferGas); vmerr != nil {
 		log.Warn("pay transfer gas error", "hash", tx.Hash, "transferGas", transferGas, "gas", tx.Gas)
-	} else {
-		log.Debug("pay transfer gas", "hash", tx.Hash, "transferGas", transferGas, "gas", tx.Gas)
+		return 0, vmerr
 	}
+	log.Debug("pay transfer gas", "hash", tx.Hash, "transferGas", transferGas, "gas", tx.Gas)
 	return
 }
 
@@ -380,29 +388,28 @@ func (tx *processTransaction) genTransitTxRecord(res *TransitionResult, vmerr er
 	res.Fee = new(big.Int).Mul(new(big.Int).SetUint64(tx.InitialGas-tx.Gas), tx.GasPrice)
 	frontotxs := make([]types.BalanceRecord, 0) //otxs that need to insert to top
 	if vmerr == nil {
+		var otx types.BalanceRecord
 		switch tx.Type {
 		case types.TxNormal, types.TxToken:
 			out := tx.Outputs[0]
 			if out.Type == Createout {
-				otx := types.GenBalanceRecord(tx.RefundAddr, res.Addrs[0], types.AccountAddress, types.AccountAddress, types.TxCreateContract, common.EmptyAddress, out.Amount)
-				frontotxs = append(frontotxs, otx)
+				otx = types.GenBalanceRecord(tx.RefundAddr, res.Addrs[0], types.AccountAddress, types.AccountAddress, types.TxCreateContract, common.EmptyAddress, out.Amount)
 			} else {
-				otx := types.GenBalanceRecord(tx.RefundAddr, out.To, types.AccountAddress, types.AccountAddress, types.TxTransfer, tx.TokenAddress, out.Amount)
-				frontotxs = append(frontotxs, otx)
+				otx = types.GenBalanceRecord(tx.RefundAddr, out.To, types.AccountAddress, types.AccountAddress, types.TxTransfer, tx.TokenAddress, out.Amount)
 			}
+			frontotxs = append(frontotxs, otx)
 		case types.TxUTXO:
 			for _, in := range tx.Inputs {
 				if common.IsLKC(tx.TokenAddress) {
 					fee := new(big.Int).Mul(new(big.Int).SetUint64(tx.InitialGas), tx.GasPrice)
-					otx := types.GenBalanceRecord(in.From, common.EmptyAddress, types.AccountAddress, types.PrivateAddress, types.TxTransfer, tx.TokenAddress, big.NewInt(0).Sub(in.Value, fee))
-					frontotxs = append(frontotxs, otx)
+					otx = types.GenBalanceRecord(in.From, common.EmptyAddress, types.AccountAddress, types.PrivateAddress, types.TxTransfer, tx.TokenAddress, big.NewInt(0).Sub(in.Value, fee))
 				} else {
-					otx := types.GenBalanceRecord(in.From, common.EmptyAddress, types.AccountAddress, types.PrivateAddress, types.TxTransfer, tx.TokenAddress, in.Value)
-					frontotxs = append(frontotxs, otx)
+					otx = types.GenBalanceRecord(in.From, common.EmptyAddress, types.AccountAddress, types.PrivateAddress, types.TxTransfer, tx.TokenAddress, in.Value)
 				}
+				frontotxs = append(frontotxs, otx)
 			}
 			for _, out := range tx.Outputs {
-				otx := types.GenBalanceRecord(tx.RefundAddr, out.To, types.PrivateAddress, types.AccountAddress, types.TxTransfer, tx.TokenAddress, out.Amount)
+				otx = types.GenBalanceRecord(tx.RefundAddr, out.To, types.PrivateAddress, types.AccountAddress, types.TxTransfer, tx.TokenAddress, out.Amount)
 				frontotxs = append(frontotxs, otx)
 			}
 
@@ -416,12 +423,11 @@ func (tx *processTransaction) genTransitTxRecord(res *TransitionResult, vmerr er
 		res.Otxs = append(frontotxs, res.Otxs...)
 	}
 	// Fee Balance Record (even with zero fee)
-	if tx.RefundAddr != common.EmptyAddress {
-		otx := types.GenBalanceRecord(tx.RefundAddr, cfg.ContractFoundationAddr, types.AccountAddress, types.AccountAddress, types.TxFee, tx.TokenAddress, res.Fee)
-		res.Otxs = append(res.Otxs, otx)
-	} else {
-		otx := types.GenBalanceRecord(common.EmptyAddress, cfg.ContractFoundationAddr, types.PrivateAddress, types.AccountAddress, types.TxFee, tx.TokenAddress, res.Fee)
-		res.Otxs = append(res.Otxs, otx)
+	fromAddrType := types.AccountAddress
+	if tx.RefundAddr == common.EmptyAddress {
+		fromAddrType = types.PrivateAddress
 	}
+	otx := types.GenBalanceRecord(tx.RefundAddr, cfg.ContractFoundationAddr, fromAddrType, types.AccountAddress, types.TxFee, tx.TokenAddress, res.Fee)
+	res.Otxs = append(res.Otxs, otx)
 	return
 }

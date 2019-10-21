@@ -273,11 +273,10 @@ func GenerateTransaction(txi types.Tx, state *state.StateDB, vmenv *vm.VmFactory
 			Data:   tx.Data(),
 			Type:   Aout,
 		}
-		if state.IsContract(*tx.To()) {
-			out.Type = Cout
-		}
 		if tx.To() == nil {
 			out.Type = Createout
+		} else if state.IsContract(*tx.To()) {
+			out.Type = Cout
 		}
 		txo.Outputs = append(txo.Outputs, out)
 		txo.Kind = types.AinAout
