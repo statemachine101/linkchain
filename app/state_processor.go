@@ -102,26 +102,31 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 	// Iterate over and process the individual transactions
 	for idx, txRaw := range block.Data.Txs {
 		if err := s.checkValid(txRaw, p.app); err != nil {
+			log.Error("Process checkValid Error", "hash", txRaw.Hash(), "err", err)
 			return nil, nil, 0, nil, nil, nil, err
 		}
 		if err := s.resetEnv(txRaw, idx); err != nil {
+			log.Error("Process resetEnv Error", "hash", txRaw.Hash(), "err", err)
 			return nil, nil, 0, nil, nil, nil, err
 		}
 		if err := s.txRawProcess(txRaw); err != nil {
+			log.Error("Process txRawProcess Error", "hash", txRaw.Hash(), "err", err)
 			return nil, nil, 0, nil, nil, nil, err
 		}
 		//TODO: replace AsMessage in /types
-		tx, ok := GenerateTransaction(txRaw, statedb, &s.Vmenv)
-		if !ok {
-			return nil, nil, 0, nil, nil, nil, errGenerateProcessTransaction
+		tx, err := GenerateTransaction(txRaw, statedb, &s.Vmenv)
+		if err != nil {
+			log.Error("Process GenerateTransaction Error", "hash", txRaw.Hash(), "err", err)
+			return nil, nil, 0, nil, nil, nil, err
 		}
 		transRes, vmerr, err := tx.Transit()
 		if err != nil {
+			log.Error("Process Transit Error", "hash", tx.Hash, "err", err)
 			return nil, nil, 0, nil, nil, nil, err
 		}
 		s.postProcess(tx, transRes, vmerr)
 	}
-	log.Debug("Process", "receipts", s.Receipts, "allLogs", s.AllLogs, "usedGas", s.UsedGas, "specialTxs", s.SpecialTxs, "utxoOutputs", s.UtxoOutputs, "keyImages", s.KeyImages)
+	log.Debug("Process", "hash", block.Hash, "receipts", s.Receipts, "allLogs", s.AllLogs, "usedGas", s.UsedGas, "specialTxs", s.SpecialTxs, "utxoOutputs", s.UtxoOutputs, "keyImages", s.KeyImages)
 	return s.Receipts, s.AllLogs, s.UsedGas, s.SpecialTxs, s.UtxoOutputs, s.KeyImages, nil
 }
 
@@ -134,7 +139,9 @@ func (s *processState) checkValid(txi types.Tx, app *LinkApplication) (err error
 		err = tx.CheckBasicWithState(nil, s.Statedb)
 
 	case *types.UTXOTransaction:
-		err = tx.CheckStoreState(app, s.Statedb)
+		if err = tx.CheckStoreState(app, s.Statedb); err != nil {
+			return
+		}
 		kms := tx.GetInputKeyImages()
 		for _, km := range kms {
 			if s.KeyImagesMap[*km] {
@@ -147,13 +154,12 @@ func (s *processState) checkValid(txi types.Tx, app *LinkApplication) (err error
 }
 
 func (s *processState) resetEnv(txi types.Tx, idx int) (err error) {
-	txh := txi.Hash()
-	s.Statedb.Prepare(txh, s.Block.Hash(), idx)
+	s.Statedb.Prepare(txi.Hash(), s.Block.Hash(), idx)
 	return nil
 }
 
-func GenerateTransaction(txi types.Tx, state *state.StateDB, vmenv *vm.VmFactory) (txo processTransaction, ok bool) {
-	ok = true
+func GenerateTransaction(txi types.Tx, state *state.StateDB, vmenv *vm.VmFactory) (txo *processTransaction, err error) {
+	txo = &processTransaction{}
 	// generic
 	txo.Type = txi.TypeName()
 	txo.State = state
@@ -164,7 +170,10 @@ func GenerateTransaction(txi types.Tx, state *state.StateDB, vmenv *vm.VmFactory
 	txo.Outputs = make([]txOutput, 0)
 	switch tx := txi.(type) {
 	case *types.ContractCreateTx: //DEPRECATED
-		from, _ := tx.From()
+		from, err := tx.From()
+		if err != nil {
+			return nil, err
+		}
 		in := txInput{
 			From:  from,
 			Value: tx.Value(),
@@ -187,7 +196,10 @@ func GenerateTransaction(txi types.Tx, state *state.StateDB, vmenv *vm.VmFactory
 		txo.InitialGas = tx.Gas()
 		txo.RefundAddr = from
 	case *types.ContractUpgradeTx:
-		from, _ := tx.From()
+		from, err := tx.From()
+		if err != nil {
+			return nil, err
+		}
 		in := txInput{
 			From:  from,
 			Value: tx.Value(),
@@ -210,7 +222,10 @@ func GenerateTransaction(txi types.Tx, state *state.StateDB, vmenv *vm.VmFactory
 		txo.InitialGas = tx.Gas()
 		txo.RefundAddr = from
 	case *types.TokenTransaction:
-		from, _ := tx.From()
+		from, err := tx.From()
+		if err != nil {
+			return nil, err
+		}
 		in := txInput{
 			From:  from,
 			Value: tx.Value(),
@@ -236,7 +251,10 @@ func GenerateTransaction(txi types.Tx, state *state.StateDB, vmenv *vm.VmFactory
 		txo.InitialGas = tx.Gas()
 		txo.RefundAddr = from
 	case *types.Transaction:
-		from, _ := tx.From()
+		from, err := tx.From()
+		if err != nil {
+			return nil, err
+		}
 		in := txInput{
 			From:  from,
 			Value: tx.Value(),
@@ -270,7 +288,10 @@ func GenerateTransaction(txi types.Tx, state *state.StateDB, vmenv *vm.VmFactory
 		txo.InitialGas = tx.Gas()
 		txo.RefundAddr = from
 	case *types.MultiSignAccountTx:
-		from, _ := tx.From()
+		from, err := tx.From()
+		if err != nil {
+			return nil, err
+		}
 		in := txInput{
 			From:  from,
 			Value: big.NewInt(0),
@@ -284,9 +305,13 @@ func GenerateTransaction(txi types.Tx, state *state.StateDB, vmenv *vm.VmFactory
 		txo.InitialGas = 0
 		txo.RefundAddr = common.EmptyAddress
 	case *types.UTXOTransaction:
-		from, _ := tx.From()
+		from := common.EmptyAddress
 		//utxo tx now depend on FROM not Ain
-		if from != common.EmptyAddress { //TODO: fix this to accept multiple inputs
+		if (tx.UTXOKind()&types.Ain) == types.Ain || !common.IsLKC(tx.TokenAddress()) { //TODO: fix this to accept multiple inputs
+			from, err = tx.From()
+			if err != nil {
+				return nil, err
+			}
 			realValue := big.NewInt(0)
 			if (tx.UTXOKind() & types.Ain) == types.Ain {
 				for _, input := range tx.Inputs {
@@ -296,9 +321,6 @@ func GenerateTransaction(txi types.Tx, state *state.StateDB, vmenv *vm.VmFactory
 					default:
 					}
 				}
-			}
-			if common.IsLKC(tx.TokenID) {
-				realValue.Sub(realValue, tx.Fee)
 			}
 			in := txInput{
 				From:  from,
@@ -312,8 +334,7 @@ func GenerateTransaction(txi types.Tx, state *state.StateDB, vmenv *vm.VmFactory
 		if (tx.UTXOKind() & types.Aout) == types.Aout {
 			msg, err := tx.AsMessage()
 			if err != nil {
-				ok = false
-				return
+				return nil, err
 			}
 			for _, accOutputData := range msg.OutputData() {
 				out := txOutput{
@@ -336,13 +357,14 @@ func GenerateTransaction(txi types.Tx, state *state.StateDB, vmenv *vm.VmFactory
 		txo.InitialGas = tx.Gas()
 		txo.RefundAddr = from
 	default:
-		ok = false
+		err = types.ErrGenerateProcessTransaction
+		return nil, err
 	}
-	//log.Debug("GenerateTransaction", "ok", ok, "tx", txo)
+	log.Debug("GenerateTransaction", "hash", txi.Hash(), "txo", txo)
 	return
 }
 
-func (s *processState) receiptProcess(tx processTransaction, transRes *TransitionResult, vmerr error) {
+func (s *processState) receiptProcess(tx *processTransaction, transRes *TransitionResult, vmerr error) {
 	if tx.Type == types.TxMultiSignAccount { // bypass this step
 		s.Receipts = append(s.Receipts, &types.Receipt{})
 		return
@@ -361,10 +383,10 @@ func (s *processState) receiptProcess(tx processTransaction, transRes *Transitio
 	if receipt.Logs != nil {
 		s.AllLogs = append(s.AllLogs, receipt.Logs...)
 	}
-	//log.Debug("receiptProcess", "receipt", receipt, "vmerr", vmerr)
+	log.Debug("receiptProcess", "hash", tx.Hash, "receipt", receipt, "vmerr", vmerr)
 }
 
-func balanceRecordProcess(tx processTransaction, transRes *TransitionResult, vmerr error) {
+func balanceRecordProcess(tx *processTransaction, transRes *TransitionResult, vmerr error) {
 	var (
 		tbr      = types.NewTxBalanceRecords()
 		hash     = tx.Hash
@@ -383,23 +405,27 @@ func balanceRecordProcess(tx processTransaction, transRes *TransitionResult, vme
 
 	if len(tx.Inputs) > 0 {
 		from = tx.Inputs[0].From
+		nonce = tx.Inputs[0].Nonce
 	}
 	if len(tx.Outputs) > 0 {
 		to = tx.Outputs[0].To
 		for _, output := range tx.Outputs {
-			payloads = append(payloads, output.Data)
+			if output.Data != nil {
+				payloads = append(payloads, output.Data)
+			}
 		}
 	}
 	for _, br := range transRes.Otxs {
 		tbr.AddBalanceRecord(br)
 	}
 	tbr.SetOptions(hash, typeName, payloads, nonce, gasLimit, gasPrice, from, to, tokenID)
-	//log.Debug("balanceRecordProcess", "txtype", tx.Type, "tbr", tbr)
+	log.Debug("balanceRecordProcess", "hash", tx.Hash, "txtype", tx.Type, "tbr", tbr)
 	types.BlockBalanceRecordsInstance.AddTxBalanceRecord(tbr)
 }
 
-func (s *processState) postProcess(tx processTransaction, transRes *TransitionResult, vmerr error) {
+func (s *processState) postProcess(tx *processTransaction, transRes *TransitionResult, vmerr error) {
 	s.receiptProcess(tx, transRes, vmerr)
+	// 交易记录开关
 	balanceRecordProcess(tx, transRes, vmerr)
 }
 
@@ -412,7 +438,6 @@ func (s *processState) txRawProcess(txi types.Tx) (err error) {
 		s.KeyImages = append(s.KeyImages, tx.GetInputKeyImages()...)
 	default:
 	}
-	//log.Debug("txRawProcess", "specialTxs", s.SpecialTxs, "utxoOutputs", s.UtxoOutputs, "keyImages", s.KeyImages)
 	return nil
 }
 

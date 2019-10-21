@@ -34,9 +34,8 @@ import (
 )
 
 var (
-	errInsufficientBalanceForGas  = errors.New("insufficient balance to pay for gas")
-	errGenerateProcessTransaction = errors.New("generate process transaction error")
-	errIntrinsicGasOverflow       = errors.New("intrinsic gas overflow")
+	errInsufficientBalanceForGas = errors.New("insufficient balance to pay for gas")
+	errIntrinsicGasOverflow      = errors.New("intrinsic gas overflow")
 )
 var (
 	cabi, _ = abi.JSON(strings.NewReader(jsondata))
@@ -102,7 +101,7 @@ func (tx *processTransaction) Transit() (res *TransitionResult, vmerr, err error
 
 	var (
 		transferGas = uint64(0)
-		transferVal = big.NewInt(0)
+		snapshot    = tx.State.Snapshot()
 	)
 
 	// Only vmerr Could be thrown afterwards
@@ -112,23 +111,27 @@ func (tx *processTransaction) Transit() (res *TransitionResult, vmerr, err error
 	if transferGas, vmerr = tx.payTransferGas(); vmerr != nil {
 		goto Done
 	}
-	if transferVal, vmerr = tx.transitOutputs(res); vmerr != nil {
+	if vmerr = tx.transitOutputs(res); vmerr != nil {
 		goto Done
 	}
 
 Done:
 	// No err/vmerr Shall be thrown afterwards
-	tx.refundGas(transferGas, transferVal, vmerr)
-	tx.setNonce()
-	tx.postTransit(res)
+	tx.postTransit(res, transferGas, snapshot, vmerr)
 	return
+}
+
+func (tx *processTransaction) postTransit(res *TransitionResult, transferGas uint64, snapshot int, vmerr error) {
+	tx.refundGas(transferGas, snapshot, vmerr)
+	tx.setNonce()
+	tx.genTransitTxRecord(res, vmerr)
 }
 
 func (tx *processTransaction) setNonce() {
 	// set nonce should be processed AFTER contract create
 	for _, in := range tx.Inputs {
 		tx.State.SetNonce(in.From, in.Nonce+1) // nonce is checked before
-		log.Debug("transitInputs: setNonce", "oldNonce", in.Nonce, "newNonce", tx.State.GetNonce(in.From))
+		log.Debug("transitInputs: setNonce", "hash", tx.Hash, "oldNonce", in.Nonce, "newNonce", tx.State.GetNonce(in.From))
 	}
 }
 
@@ -150,10 +153,10 @@ func (tx *processTransaction) checkNonce() (err error) {
 	for _, ain := range tx.Inputs {
 		nonce := tx.State.GetNonce(ain.From)
 		if nonce < ain.Nonce {
-			log.Warn("preCheck: nonce too high", "from", ain.From, "stateNonce", nonce, "TxNonce", ain.Nonce)
+			log.Warn("preCheck: nonce too high", "hash", tx.Hash, "from", ain.From, "stateNonce", nonce, "TxNonce", ain.Nonce)
 			return types.ErrNonceTooHigh
 		} else if nonce > ain.Nonce {
-			log.Warn("preCheck: nonce too low", "from", ain.From, "stateNonce", nonce, "TxNonce", ain.Nonce)
+			log.Warn("preCheck: nonce too low", "hash", tx.Hash, "from", ain.From, "stateNonce", nonce, "TxNonce", ain.Nonce)
 			return types.ErrNonceTooLow
 		}
 	}
@@ -161,14 +164,21 @@ func (tx *processTransaction) checkNonce() (err error) {
 }
 
 func (tx *processTransaction) buyGas() (err error) { // default use Input[0] to buy gas
+	if tx.Type == types.TxContractCreate || tx.Type == types.TxContractUpgrade { // cct & cut bypass
+		return
+	}
+	if tx.Type == types.TxUTXO && common.IsLKC(tx.TokenAddress) { // lkc utxo bypass
+		return
+	}
 	if tx.RefundAddr != common.EmptyAddress {
 		mgval := new(big.Int).Mul(new(big.Int).SetUint64(tx.Gas), tx.GasPrice)
 		from := tx.RefundAddr
 		if tx.State.GetBalance(from).Cmp(mgval) < 0 {
-			log.Warn("buyGas: insufficient gas", "from", from, "gas", tx.Gas, "gasPrice", tx.GasPrice)
+			log.Warn("buyGas: not enough gas", "hash", tx.Hash, "needval", mgval, "balance", tx.State.GetBalance(from))
 			return errInsufficientBalanceForGas
 		}
 		tx.State.SubBalance(from, mgval)
+		log.Debug("buyGas", "hash", tx.Hash, "needval", mgval, "balance", tx.State.GetBalance(from))
 	}
 	return
 }
@@ -202,7 +212,7 @@ func (tx *processTransaction) payIntrinsicGas() (err error) {
 	if err = tx.useGas(intrinsicGas); err != nil {
 		return
 	}
-	log.Debug("payIntrinsicGas", "intrinsicGas", intrinsicGasSum, "gasleft", tx.Gas)
+	log.Debug("payIntrinsicGas", "hash", tx.Hash, "intrinsicGas", intrinsicGasSum, "gasleft", tx.Gas)
 	return
 }
 
@@ -212,14 +222,14 @@ func (tx *processTransaction) transitInputs() (vmerr error) {
 	for _, in := range tx.Inputs {
 		balance := tx.State.GetTokenBalance(in.From, tx.TokenAddress)
 		if balance.Cmp(in.Value) < 0 {
-			log.Warn("transitInputs: insufficient balance", "value", in.Value, "balance", balance, "from", in.From, "token", tx.TokenAddress)
+			log.Warn("transitInputs: insufficient balance", "hash", tx.Hash, "value", in.Value, "balance", balance, "from", in.From, "token", tx.TokenAddress)
 			return types.ErrInsufficientFunds
 		}
 	}
 	// sub balance
 	for _, in := range tx.Inputs {
 		tx.State.SubTokenBalance(in.From, tx.TokenAddress, in.Value)
-		log.Debug("transitInputs: sub balance", "from", in.From, "token", tx.TokenAddress, "value", in.Value)
+		log.Debug("transitInputs: sub balance", "hash", tx.Hash, "from", in.From, "token", tx.TokenAddress, "value", in.Value)
 	}
 	return
 }
@@ -239,20 +249,19 @@ func (tx *processTransaction) payTransferGas() (transferGas uint64, vmerr error)
 		}
 	}
 	if vmerr = tx.useGas(transferGas); vmerr != nil {
-		log.Warn("pay transfer gas error", "transferGas", transferGas, "gas", tx.Gas)
+		log.Warn("pay transfer gas error", "hash", tx.Hash, "transferGas", transferGas, "gas", tx.Gas)
 	} else {
-		log.Debug("pay transfer gas", "transferGas", transferGas, "gas", tx.Gas)
+		log.Debug("pay transfer gas", "hash", tx.Hash, "transferGas", transferGas, "gas", tx.Gas)
 	}
 	return
 }
 
-func (tx *processTransaction) transitOutputs(res *TransitionResult) (transferVal *big.Int, vmerr error) {
+func (tx *processTransaction) transitOutputs(res *TransitionResult) (vmerr error) {
 	var (
 		ret         []byte
 		addr        common.Address
 		byteCodeGas uint64
 	)
-	transferVal = big.NewInt(0)
 
 	for _, out := range tx.Outputs {
 		if out.Type == Createout {
@@ -263,7 +272,7 @@ func (tx *processTransaction) transitOutputs(res *TransitionResult) (transferVal
 			vm.SetToken(tx.TokenAddress)
 			from := evm.AccountRef(tx.RefundAddr)
 			ret, addr, tx.Gas, vmerr = vm.Create(from, out.Data, tx.Gas, out.Amount) //TODO: rewind mechanism
-			log.Debug("transitOutputs: contract create", "gas", tx.Gas, "vmerr", vmerr)
+			log.Debug("transitOutputs: contract create", "hash", tx.Hash, "gas", tx.Gas, "vmerr", vmerr)
 			if vmerr != nil {
 				if bytes.HasPrefix(ret, cerrID) {
 					var reason string
@@ -271,10 +280,10 @@ func (tx *processTransaction) transitOutputs(res *TransitionResult) (transferVal
 						vmerr = fmt.Errorf("%v: %s", vmerr, reason)
 					}
 				}
+				log.Warn("transitOutputs: vm create error", "hash", tx.Hash, "msg", string(ret))
 				tx.Gas += vm.RefundAllFee()
 				return
 			}
-			transferVal = big.NewInt(0).Add(transferVal, out.Amount)
 			tx.Gas += vm.RefundFee()
 			res.Rets = append(res.Rets, ret)
 			res.Addrs = append(res.Addrs, addr)
@@ -287,11 +296,11 @@ func (tx *processTransaction) transitOutputs(res *TransitionResult) (transferVal
 			vm.SetToken(tx.TokenAddress)
 			from := evm.AccountRef(tx.RefundAddr)
 			vm.Upgrade(from, out.To, out.Data)
-			log.Debug("transitOutputs: contract update")
+			log.Debug("transitOutputs: contract update", "hash", tx.Hash)
 
 		} else if out.Type == Aout {
 			tx.State.AddTokenBalance(out.To, tx.TokenAddress, out.Amount) // this cannot undone, so we dont refund here
-			log.Debug("transitOutputs: add balance", "to", out.To, "token", tx.TokenAddress, "amount", out.Amount)
+			log.Debug("transitOutputs: add balance", "hash", tx.Hash, "to", out.To, "token", tx.TokenAddress, "amount", out.Amount)
 
 		} else if out.Type == Cout {
 			msgcode := tx.State.GetCode(out.To)
@@ -300,9 +309,8 @@ func (tx *processTransaction) transitOutputs(res *TransitionResult) (transferVal
 			vm.Reset(types.NewMessage(tx.RefundAddr, nil, tx.TokenAddress, tx.State.GetNonce(tx.RefundAddr), nil, 0, tx.GasPrice, nil))
 			vm.SetToken(tx.TokenAddress)
 			from := evm.AccountRef(tx.RefundAddr)
-			log.Debug("transitOutputs: before contract call", "gas", tx.Gas)
 			ret, tx.Gas, byteCodeGas, vmerr = vm.UTXOCall(from, out.To, tx.TokenAddress, out.Data, tx.Gas, out.Amount)
-			log.Debug("transitOutputs: after contract call", "gas", tx.Gas, "vmerr", vmerr)
+			log.Debug("transitOutputs: contract call", "hash", tx.Hash, "gas", tx.Gas, "vmerr", vmerr)
 			if vmerr != nil {
 				if bytes.HasPrefix(ret, cerrID) {
 					var reason string
@@ -310,15 +318,14 @@ func (tx *processTransaction) transitOutputs(res *TransitionResult) (transferVal
 						vmerr = fmt.Errorf("%v: %s", vmerr, reason)
 					}
 				}
-				log.Warn("transitOutputs: VM err", "msg", string(ret))
+				log.Warn("transitOutputs: vm call error", "hash", tx.Hash, "msg", string(ret))
 				tx.Gas += vm.RefundAllFee()
 				return
 			}
 			if out.To == cfg.ContractBlacklistAddr { // check black list contract
-				log.Debug("transitOutputs: start to deal black addrs changes", "msg", string(ret))
+				log.Debug("transitOutputs: start to deal black addrs changes", "hash", tx.Hash, "msg", string(ret))
 				types.BlacklistInstance.DealBlackAddrsChanges(ret)
 			}
-			transferVal = big.NewInt(0).Add(transferVal, out.Amount)
 			res.Rets = append(res.Rets, ret)
 			res.Otxs = append(res.Otxs, vm.GetOTxs()...)
 			res.ByteCodeGas += byteCodeGas
@@ -327,52 +334,81 @@ func (tx *processTransaction) transitOutputs(res *TransitionResult) (transferVal
 	}
 	usedGas := tx.InitialGas - tx.Gas
 	fee := big.NewInt(0).Mul(big.NewInt(0).SetUint64(usedGas), tx.GasPrice)
-	log.Debug("transition end", "usedGas", usedGas, "fee", fee)
+	log.Debug("transition end", "hash", tx.Hash, "usedGas", usedGas, "fee", fee)
 	res.Fee = fee
 	return
 }
 
-func (tx *processTransaction) refundGas(transferGas uint64, transferVal *big.Int, vmerr error) {
+func (tx *processTransaction) refundGas(transferGas uint64, snapshot int, vmerr error) {
 	if vmerr != nil {
-		// refund value
-		tx.State.AddBalance(tx.RefundAddr, transferVal)
+		// revert state
+		tx.State.RevertToSnapshot(snapshot)
+		// refund utxo value
+		if tx.Type == types.TxUTXO && (tx.Kind&types.UinAout) == types.UinAout {
+			refundValue := big.NewInt(0)
+			for _, out := range tx.Outputs {
+				if out.Type != Uout {
+					refundValue.Add(refundValue, out.Amount)
+				}
+			}
+			for _, in := range tx.Inputs {
+				if in.Type != Uin {
+					refundValue.Sub(refundValue, in.Value)
+				}
+			}
+			tx.State.AddTokenBalance(tx.RefundAddr, tx.TokenAddress, refundValue)
+		}
 		// calculate refund gas (VM gas is refunded in processOutputs)
 		tx.Gas += transferGas
 	}
-	// refund all cost gas for cct/cut
+	// cct/cut do not buy gas or refund gas
 	if tx.Type == types.TxContractCreate || tx.Type == types.TxContractUpgrade {
 		tx.Gas = tx.InitialGas
+		return
 	}
 	// do refund gas
 	remaining := new(big.Int).Mul(new(big.Int).SetUint64(tx.Gas), tx.GasPrice)
 	if remaining.Sign() > 0 {
-		log.Debug("refundGas to", "addr", tx.RefundAddr, "gas", tx.Gas, "remaining", remaining)
+		log.Debug("refundGas to", "hash", tx.Hash, "addr", tx.RefundAddr, "gas", tx.Gas, "remaining", remaining)
 		tx.State.AddBalance(tx.RefundAddr, remaining)
 	}
 }
 
-func (tx *processTransaction) postTransit(res *TransitionResult) {
+func (tx *processTransaction) genTransitTxRecord(res *TransitionResult, vmerr error) {
+	// 交易记录开关
 	res.Gas = tx.InitialGas - tx.Gas
 	res.Fee = new(big.Int).Mul(new(big.Int).SetUint64(tx.InitialGas-tx.Gas), tx.GasPrice)
 	frontotxs := make([]types.BalanceRecord, 0) //otxs that need to insert to top
-	switch tx.Type {
-	case types.TxNormal, types.TxToken:
-		out := tx.Outputs[0]
-		addr := common.EmptyAddress
-		if out.Type == Createout {
-			addr = res.Addrs[0]
-		} else {
-			addr = out.To
-		}
-		otx := types.GenBalanceRecord(tx.RefundAddr, addr, types.AccountAddress, types.AccountAddress, types.TxTransfer, tx.TokenAddress, out.Amount)
-		frontotxs = append(frontotxs, otx)
-	case types.TxUTXO:
-		for _, in := range tx.Inputs {
-			otx := types.GenBalanceRecord(in.From, common.EmptyAddress, types.AccountAddress, types.PrivateAddress, types.TxTransfer, tx.TokenAddress, in.Value)
-			frontotxs = append(frontotxs, otx)
-		}
-		for _, out := range tx.Outputs {
-			otx := types.GenBalanceRecord(tx.RefundAddr, out.To, types.PrivateAddress, types.AccountAddress, types.TxTransfer, tx.TokenAddress, out.Amount)
+	if vmerr == nil {
+		switch tx.Type {
+		case types.TxNormal, types.TxToken:
+			out := tx.Outputs[0]
+			if out.Type == Createout {
+				otx := types.GenBalanceRecord(tx.RefundAddr, res.Addrs[0], types.AccountAddress, types.AccountAddress, types.TxCreateContract, common.EmptyAddress, out.Amount)
+				frontotxs = append(frontotxs, otx)
+			} else {
+				otx := types.GenBalanceRecord(tx.RefundAddr, out.To, types.AccountAddress, types.AccountAddress, types.TxTransfer, tx.TokenAddress, out.Amount)
+				frontotxs = append(frontotxs, otx)
+			}
+		case types.TxUTXO:
+			for _, in := range tx.Inputs {
+				if common.IsLKC(tx.TokenAddress) {
+					fee := new(big.Int).Mul(new(big.Int).SetUint64(tx.InitialGas), tx.GasPrice)
+					otx := types.GenBalanceRecord(in.From, common.EmptyAddress, types.AccountAddress, types.PrivateAddress, types.TxTransfer, tx.TokenAddress, big.NewInt(0).Sub(in.Value, fee))
+					frontotxs = append(frontotxs, otx)
+				} else {
+					otx := types.GenBalanceRecord(in.From, common.EmptyAddress, types.AccountAddress, types.PrivateAddress, types.TxTransfer, tx.TokenAddress, in.Value)
+					frontotxs = append(frontotxs, otx)
+				}
+			}
+			for _, out := range tx.Outputs {
+				otx := types.GenBalanceRecord(tx.RefundAddr, out.To, types.PrivateAddress, types.AccountAddress, types.TxTransfer, tx.TokenAddress, out.Amount)
+				frontotxs = append(frontotxs, otx)
+			}
+
+		case types.TxContractCreate:
+			out := tx.Outputs[0]
+			otx := types.GenBalanceRecord(tx.RefundAddr, res.Addrs[0], types.AccountAddress, types.AccountAddress, types.TxCreateContract, common.EmptyAddress, out.Amount)
 			frontotxs = append(frontotxs, otx)
 		}
 	}
@@ -381,12 +417,11 @@ func (tx *processTransaction) postTransit(res *TransitionResult) {
 	}
 	// Fee Balance Record (even with zero fee)
 	if tx.RefundAddr != common.EmptyAddress {
-		otx := types.GenBalanceRecord(tx.RefundAddr, cfg.ContractFoundationAddr, types.AccountAddress, types.AccountAddress, types.TxFee, common.EmptyAddress, res.Fee)
+		otx := types.GenBalanceRecord(tx.RefundAddr, cfg.ContractFoundationAddr, types.AccountAddress, types.AccountAddress, types.TxFee, tx.TokenAddress, res.Fee)
 		res.Otxs = append(res.Otxs, otx)
 	} else {
-		otx := types.GenBalanceRecord(common.EmptyAddress, cfg.ContractFoundationAddr, types.PrivateAddress, types.AccountAddress, types.TxFee, common.EmptyAddress, res.Fee)
+		otx := types.GenBalanceRecord(common.EmptyAddress, cfg.ContractFoundationAddr, types.PrivateAddress, types.AccountAddress, types.TxFee, tx.TokenAddress, res.Fee)
 		res.Otxs = append(res.Otxs, otx)
 	}
-	//log.Debug("postTransit", "TransitionResult", *res)
 	return
 }
